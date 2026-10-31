@@ -10,6 +10,11 @@ R=Path(__file__).resolve().parents[1]
 s=(R/'WhateverXe/kern_xe.cpp').read_text()
 a=argparse.ArgumentParser();a.add_argument('--kernel',type=Path);a=a.parse_args()
 bridges='\n'.join(re.search(r'extern "C" __attribute__\(\(naked,used\)\) void tglTahoePmap'+kind+r'Bridge\(\) \{.*?\n\}',s,re.S)[0] for kind in ['New','Update'])
+# IOProtectCacheMode+CC calls pmap_enter_options; each pair is that build's symbols and native rel32.
+assert 'fn-(protect+0xCC+sizeof(protectCall))' in s
+for protect,fn,rel32 in [(0xffffff800039ac00,0xffffff80003ca000,'2ff30200'), # 25G241
+                         (0xffffff800039b410,0xffffff80003ca840,'5ff30200')]: # 25G332
+ assert struct.pack('<i',fn-(protect+0xCC+5)).hex()==rel32
 if a.kernel:
  d=a.kernel.read_bytes()
  assert hashlib.sha256(d).hexdigest()=='7004ebc1020a5c7e3f075c631507f31fdc0ce3fe02e9f01f42dce1d178770a08'
@@ -30,8 +35,10 @@ if a.kernel:
   sites[name]=(0 if base=='fn' else 0xffffff800039ac00-0xffffff80003ca000)+(int(offset[1:],16) if offset else 0)
  assert len(sites)==9,sites
  for name,offset in sites.items():
-  values=re.search(r'const uint8_t '+name+r'\[\] \{([^}]+)\}',block)[1]
-  values=bytes(int(v.strip(),0) for v in values.split(','))
+  if name=='protectCall':values=b'\xE8'+struct.pack('<i',-(offset+5))
+  else:
+   values=re.search(r'const uint8_t '+name+r'\[\] \{([^}]+)\}',block)[1]
+   values=bytes(int(v.strip(),0) for v in values.split(','))
   assert read(0xffffff80003ca000+offset,len(values))==values,name
  print('PASS: exact kernel SHA and all 9 runtime guards')
 cpp=r'''#include <stdint.h>
