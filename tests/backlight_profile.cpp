@@ -9,7 +9,7 @@ int main() {
  unsigned previous=0;
  for(unsigned i=0;i<count;++i) {
   const unsigned value=(curve[2+2*i]<<8)|curve[3+2*i];
-  assert(i ? value>previous : value==0);previous=value;
+  assert(i ? value>previous : value==654);previous=value; // Never fully off.
  }
  assert(previous>65000 && previous<=65535);
  assert(eligible(19,0,65535,true));

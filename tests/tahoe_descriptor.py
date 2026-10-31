@@ -42,8 +42,67 @@ int main(int argc,char **argv) {
  assert(!image(nullptr));
  if(argc>1) {
   FILE *f=fopen(argv[1],"rb"); assert(f); assert(fread(page,1,sizeof(page),f)==sizeof(page)); fclose(f);
-  assert(admitted(page,0,true,false,"25G332"));
+  // Under the hook a read returns the patched page from the unified buffer cache.
+  uint8_t expected[sizeof(page)]; memcpy(expected,page,sizeof(page));
+  for(auto &g:gates) memcpy(expected+g.offset,g.code,sizeof(g.code));
+  apply(expected);
+  assert(admitted(page,0,true,false,"25G332") || !memcmp(page,expected,sizeof(page)));
   puts("PASS: installed impostor.dylib satisfies both gates");
+ }
+ // TGLVA build literal, on its own page and never confused with the bridge.
+ memset(page,0x90,sizeof(page)); memcpy(page+videoOffset,videoCode,sizeof(videoCode));
+ assert(videoAdmitted(page,videoPage,true,false,"25G332"));
+ assert(!videoAdmitted(page,0,true,false,"25G332"));
+ assert(!videoAdmitted(page,videoPage,true,false,"25G241"));
+ assert(!videoAdmitted(page,videoPage,false,false,"25G332"));
+ assert(!videoAdmitted(page,videoPage,true,true,"25G332"));
+ assert(!videoAdmitted(nullptr,videoPage,true,false,"25G332"));
+ for(size_t i=0;i<sizeof(videoCode);++i) {
+  memcpy(page+videoOffset,videoCode,sizeof(videoCode)); page[videoOffset+i]^=0xff;
+  assert(!videoAdmitted(page,videoPage,true,false,"25G332"));
+ }
+ memcpy(page+videoOffset,videoCode,sizeof(videoCode)); applyVideo(page);
+ assert(!memcmp(page+videoOffset+videoBuild,"25G332",7));
+ assert(!memcmp(page+videoOffset,videoCode,videoBuild));
+ assert(!memcmp(page+videoOffset+videoBuild+7,videoCode+videoBuild+7,sizeof(videoCode)-videoBuild-7));
+ assert(!videoAdmitted(page,videoPage,true,false,"25G332"));
+ assert(videoImage("/System/Volumes/Data/Library/GPUBundles/AppleIntelTGLGraphicsVADriver.bundle/Contents/MacOS/TGLVA"));
+ assert(!videoImage("/Library/GPUBundles/AppleIntelTGLGraphicsMTLDriver.bundle/Contents/MacOS/impostor.dylib"));
+ assert(!image("/Library/GPUBundles/AppleIntelTGLGraphicsVADriver.bundle/Contents/MacOS/TGLVA"));
+ assert(!videoImage(nullptr));
+ if(argc>2) {
+  FILE *f=fopen(argv[2],"rb"); assert(f); assert(!fseek(f,videoPage,SEEK_SET)); assert(fread(page,1,sizeof(page),f)==sizeof(page)); fclose(f);
+  assert(videoAdmitted(page,videoPage,true,false,"25G332") || !memcmp(page+videoOffset+videoBuild,"25G332",7));
+  puts("PASS: installed TGLVA satisfies the video gate");
+ }
+ // Pixel-transfer sites: each page alone, exact bytes, one pass only, same sizes.
+ for(auto &site:driverSites) {
+  assert(site.size<=sizeof(site.before));
+  memset(page,0x90,sizeof(page)); memcpy(page+site.offset,site.before,site.size);
+  assert(driverSite(page,site.page,true,false,"25G332")==&site);
+  assert(!driverSite(page,site.page+0x1000,true,false,"25G332"));
+  assert(!driverSite(page,site.page,true,false,"25G241"));
+  assert(!driverSite(page,site.page,false,false,"25G332"));
+  assert(!driverSite(page,site.page,true,true,"25G332"));
+  for(size_t i=0;i<site.size;++i) {
+   memcpy(page+site.offset,site.before,site.size); page[site.offset+i]^=0xff;
+   assert(!driverSite(page,site.page,true,false,"25G332"));
+  }
+  memcpy(page+site.offset,site.before,site.size); applyDriver(page,site);
+  assert(!memcmp(page+site.offset,site.after,site.size));
+  assert(!driverSite(page,site.page,true,false,"25G332"));
+ }
+ // The rewritten block keeps the null branch: mov;mov;test;je +0xc;nop;nop before 0x1b1d55.
+ {auto &a=driverSites[0];assert(a.after[17]==0x74 && a.after[18]==0x0c && 0x1b1d40+19+a.after[18]==0x1b1d5f && a.size==21);}
+ assert(driverImage("/System/Volumes/Data/Library/GPUBundles/AppleIntelTGLGraphicsVADriver.bundle/Contents/MacOS/AppleIntelTGLGraphicsVADriver"));
+ assert(!driverImage("/Library/GPUBundles/AppleIntelTGLGraphicsVADriver.bundle/Contents/MacOS/TGLVA"));
+ assert(!driverImage(nullptr));
+ if(argc>3) {
+  for(auto &site:driverSites) {
+   FILE *f=fopen(argv[3],"rb"); assert(f); assert(!fseek(f,site.page,SEEK_SET)); assert(fread(page,1,sizeof(page),f)==sizeof(page)); fclose(f);
+   assert(driverSite(page,site.page,true,false,"25G332")==&site || !memcmp(page+site.offset,site.after,site.size));
+  }
+  puts("PASS: installed video driver satisfies both pixel-transfer sites");
  }
  puts("PASS: descriptor gates are exact, validated-only and build-bound");
 }
@@ -52,4 +111,6 @@ installed = pathlib.Path('/Library/GPUBundles/AppleIntelTGLGraphicsMTLDriver.bun
 with tempfile.TemporaryDirectory(prefix='tahoe-descriptor-') as temp:
     p = pathlib.Path(temp); (p/'t.cpp').write_text(harness)
     subprocess.run(['clang++','-std=c++17','-I',str(root/'WhateverXe'),str(p/'t.cpp'),'-o',str(p/'t')],check=True)
-    subprocess.run([str(p/'t')]+([str(installed)] if installed.exists() else []),check=True)
+    video = pathlib.Path('/Library/GPUBundles/AppleIntelTGLGraphicsVADriver.bundle/Contents/MacOS/TGLVA')
+    driver = video.with_name('AppleIntelTGLGraphicsVADriver')
+    subprocess.run([str(p/'t')]+([str(installed),str(video),str(driver)] if installed.exists() and video.exists() and driver.exists() else []),check=True)

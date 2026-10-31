@@ -1,4 +1,5 @@
 #include "kern_display13_color.hpp"
+#include "kern_hang_capture_policy.hpp"
 #include <mach/clock.h>
 //
 //  kern_xe.cpp
@@ -87,7 +88,6 @@
 #include <libkern/c++/OSSerialize.h>
 #include <libkern/c++/OSData.h>
 #include <IOKit/IODeviceTreeSupport.h> // EXPERIMENT
-#include <IOKit/pwr_mgt/RootDomain.h> // EXPERIMENT
 
 extern "C" const char version[];
 extern "C" void tglHangPreStopWake(void *,bool,unsigned,unsigned,void *);
@@ -993,6 +993,49 @@ static __attribute__((noinline)) void adlnRunKernelContextTrial(IOService *owner
   }
  }
  clock_get_uptime(&ticks);absolutetime_to_nanoseconds(ticks,q+19);adlnKernelContextPublish();
+}
+// EXPERIMENT: one read-only snapshot of a batch stuck on MEDIA_OBJECT, behind -wexhangcap.
+// The native analysis allocates here, so this path runs in thread context.
+static uintptr_t hangCaptureOriginal;
+static uint8_t *hangCaptureBuffer;
+static bool hangCaptureDone;
+static bool hangCapturePhysical(uint64_t physical,void *out,size_t size) {
+ const auto address=tglVM.directBase+physical;
+ return tglVM.nofault && address>=tglVM.directBase && address+size<=tglVM.directEnd &&
+  tglVM.nofault(address,reinterpret_cast<uint64_t>(out),size)==size;
+}
+static void hangCaptureAnalysis(void *ring) {
+ uint64_t mmio=0;
+ if(tglVMRead(reinterpret_cast<uint64_t>(ring)+0x50,mmio) && mmio) {
+  auto reg=[mmio](uint32_t offset){return *reinterpret_cast<volatile uint32_t *>(mmio+offset);};
+  if(HangCapture::admitted(reg(HangCapture::instruction)) && !__atomic_exchange_n(&hangCaptureDone,true,__ATOMIC_RELAXED)) {
+   // The global table occupies the upper half of the 16M register BAR.
+   auto global=[mmio](uint64_t index){return index<0x100000?*reinterpret_cast<volatile uint64_t *>(mmio+0x800000+index*8):0ULL;};
+   const auto bytes=HangCapture::capture(reg,global,hangCapturePhysical,hangCaptureBuffer);
+   IORegistryEntry::getRegistryRoot()->setProperty("WEXHangCapture",hangCaptureBuffer,static_cast<unsigned>(bytes));
+   SYSLOG("igfx","hang capture stored %lu bytes",static_cast<unsigned long>(bytes));
+  }
+ }
+ FunctionCast(hangCaptureAnalysis,hangCaptureOriginal)(ring);
+}
+static __attribute__((noinline)) void hangCaptureInstall(KernelPatcher &patcher,size_t index,mach_vm_address_t address,size_t size) {
+ if(!checkKernelArgument("-wexhangcap"))return;
+ const char *symbol="__ZN20IGHardwareRingBuffer14doHangAnalysisEv";
+ static const uint8_t head[] {0x55,0x48,0x89,0xE5,0x41,0x57,0x41,0x56,0x53,0x50,0x49,0x89,0xFE,0x48,0x8B,0x47,0x10};
+ // checkPageFault proves the ring keeps the register base at +50.
+ static const uint8_t base[] {0x48,0x8B,0x47,0x50,0x8B,0x80,0xC4,0xCE,0,0};
+ bool ready=size>0x43F40 && patcher.solveSymbol<mach_vm_address_t>(index,symbol,address,size)==address+0x438C6 &&
+  !memcmp(reinterpret_cast<const void *>(address+0x438C6),head,sizeof(head)) &&
+  !memcmp(reinterpret_cast<const void *>(address+0x43F2E),base,sizeof(base));
+ patcher.clearError();
+ if(ready)hangCaptureBuffer=static_cast<uint8_t *>(IOMalloc(HangCapture::bufferBytes));
+ ready=ready && hangCaptureBuffer;
+ if(ready) {
+  KernelPatcher::RouteRequest route(symbol,hangCaptureAnalysis,hangCaptureOriginal);
+  ready=patcher.routeMultiple(index,&route,1,address,size);
+  patcher.clearError();
+ }
+ IORegistryEntry::getRegistryRoot()->setProperty("WEXHangCaptureReady",ready);
 }
 static __attribute__((noinline)) void adlnPrepareRCSProfile(KernelPatcher &patcher,size_t index,mach_vm_address_t address,size_t size) {
   // Qualify these native entries before the ordinary host observer routes.
@@ -4459,41 +4502,19 @@ bool XE::processKext(KernelPatcher &patcher, size_t index, mach_vm_address_t add
 
 static bool adlnWriterMappingBound();
 static uint64_t wexDiagEDP[34]; // DIAG: published with N97FBBootHandoffCheck.
-// EXPERIMENT: one boot only. Userspace turns an arm into a go token naming this boot session.
-// The kernel only reads NVRAM here, so a hang cannot leave anything half written, and any
-// later boot has a different session ID and fails closed.
-extern "C" int sysctlbyname(const char *,void *,size_t *,void *,size_t);
-static bool wexEDPArmed;
-static void wexCheckEDPGo() {
- // Token: "<session uuid>.<boot seconds>". Any one identity source may match; all of them only read.
- char session[37] {};size_t length=sizeof(session);uint64_t boot[2] {};size_t bootLength=sizeof(boot);
- uint64_t r[10] {3};
- r[1]=static_cast<uint32_t>(sysctlbyname("kern.bootsessionuuid",session,&length,nullptr,0));r[2]=length;
- r[3]=static_cast<uint32_t>(sysctlbyname("kern.boottime",boot,&bootLength,nullptr,0));r[4]=boot[0];
- auto domain=IOService::getPMRootDomain();
- auto pmObject=domain ? domain->copyProperty("BootSessionUUID") : nullptr;
- auto pm=OSDynamicCast(OSString,pmObject);r[5]=pm!=nullptr;
+// EXPERIMENT: adopt the firmware-lit eDP panel unless told not to. Either switch only reads:
+// boot-arg -wexedpoff, editable from another OS on the EFI, or the NVRAM variable wex-edp-off.
+static bool wexEDPBootPanel=true;
+static void wexCheckEDPOff() {
+ const bool argument=checkKernelArgument("-wexedpoff");
  auto entry=IORegistryEntry::fromPath("/options",gIODTPlane);
- auto token=entry ? entry->copyProperty("wex-edp-go") : nullptr;
- auto data=OSDynamicCast(OSData,token);auto text=OSDynamicCast(OSString,token);
- auto bytes=static_cast<const char *>(data ? data->getBytesNoCopy() : text ? static_cast<const void *>(text->getCStringNoCopy()) : nullptr);
- const unsigned size=data ? data->getLength() : text ? text->getLength() : 0;
- r[6]=bytes!=nullptr;
- if(bytes && size>=36) {
-  r[7]=!r[1] && length>=36 && !memcmp(bytes,session,36);
-  r[8]=pm && pm->getLength()==36 && !memcmp(bytes,pm->getCStringNoCopy(),36);
-  uint64_t seconds=0;bool number=size>37 && bytes[36]=='.';
-  for(unsigned i=37;number && i<size && bytes[i];++i) {
-   if(bytes[i]<'0' || bytes[i]>'9')number=false;
-   else seconds=seconds*10+static_cast<uint64_t>(bytes[i]-'0');
-  }
-  const auto delta=seconds>boot[0] ? seconds-boot[0] : boot[0]-seconds;
-  if(number && !r[3] && boot[0] && delta<=5)r[8]|=2;
- }
- wexEDPArmed=r[7] || r[8];r[9]=wexEDPArmed;
- OSSafeReleaseNULL(token);OSSafeReleaseNULL(entry);OSSafeReleaseNULL(pmObject);
- IORegistryEntry::getRegistryRoot()->setProperty("WEXEDPOnce",r,sizeof(r));
- SYSLOG("igfx","eDP one-shot sysctl=%llu/%llu time=%llu pm=%llu token=%llu match=%llu/%llu armed=%llu",r[1],r[2],r[3],r[5],r[6],r[7],r[8],r[9]);
+ auto value=entry ? entry->copyProperty("wex-edp-off") : nullptr;
+ const bool variable=value!=nullptr;
+ OSSafeReleaseNULL(value);OSSafeReleaseNULL(entry);
+ wexEDPBootPanel=!argument && !variable;
+ uint64_t r[] {4,argument,variable,wexEDPBootPanel};
+ IORegistryEntry::getRegistryRoot()->setProperty("WEXEDPSwitch",r,sizeof(r));
+ SYSLOG("igfx","eDP boot panel argument=%d variable=%d enabled=%d",argument,variable,wexEDPBootPanel);
 }
 namespace {
 struct Display13GMBusScope {
@@ -8024,7 +8045,7 @@ bool XE::wrapDisplay13FramebufferStart(IOService *that,IOService *provider) {
 		s->orgAlderLakeNSysMemAllocate!=0,s->orgAlderLakeNSysMemFree!=0,display13FBSysMem.lock!=nullptr,display13FBSysMem.retireLock!=nullptr,adlnFixedSysMemEnabled};
 	IORegistryEntry::getRegistryRoot()->setProperty("N97FramebufferDualPolicy",dualPolicy,sizeof(dualPolicy));
 	if(Display13FBTopology::multiOutputWiring(s->adlnOutputWiring) && !dualReady)return false;
-	wexCheckEDPGo(); // EXPERIMENT
+	wexCheckEDPOff(); // EXPERIMENT
 	// Native provider-workloop mode creates/binds the PCI interrupt source in
 	// controller start, rather than waiting for an accelerator or FB open.
 	// This backend supports linear boot surfaces and Y-tiled native scanout,
@@ -8219,7 +8240,7 @@ void XE::wrapAlderLakeNSetupWorkLoop(IOService *controller,IOWorkLoop *workLoop)
                     wexDiagEDP[26]=trans;wexDiagEDP[27]=tp;wexDiagEDP[28]=buf;wexDiagEDP[29]=clock;wexDiagEDP[30]=aux;
                     wexDiagEDP[31]=diagIO.read(Display13Power::Driver);
                 }
-                if(dp && display13SSTPort(port,wexEDPArmed)) {
+                if(dp && display13SSTPort(port,wexEDPBootPanel)) {
                     Display13FBBootIO io{c.map};auto &boot=c.displayScratch;AlderLakeN::readDisplay(io,true,boot);
                     if(ddi>=3) {
                         const auto source=Display13TC::Boot::capture(io,true,ddi,0);
@@ -10606,6 +10627,7 @@ bool XE::processTGLAccelerator(KernelPatcher &patcher, size_t index, mach_vm_add
  const bool surfaceABIReady=tglInstallSonomaSurfaceABI(patcher,index,address,size,false);
  IORegistryEntry::getRegistryRoot()->setProperty("TGLSonomaSurfaceAcceleratorReady",surfaceABIReady);
  if(adlnDetected && (checkKernelArgument("-wex-adln-kernel-ctx") || adlnNativeRCSProfileRequested))adlnPrepareRCSProfile(patcher,index,address,size);
+ hangCaptureInstall(patcher,index,address,size); // EXPERIMENT
    // Serialize only the two direct stores in detectEDRAM. The original
    // forcewake and 1000ms sleep remain outside the shared gate.
    {

@@ -12,21 +12,29 @@ int (*getPath)(void *,char *,int *);
 const char *runningBuild;
 
 // Keeps the path buffer off the stack of every other page validation.
-__attribute__((noinline)) bool isImage(void *vnode) {
+__attribute__((noinline)) bool pathMatches(void *vnode,bool (*match)(const char *)) {
  char path[1024];
  int length=sizeof(path);
  // vn_getpath does not enter the filesystem, and only a matching page reaches it.
- return !getPath(vnode,path,&length) && TahoeDescriptor::image(path);
+ return !getPath(vnode,path,&length) && match(path);
 }
 
 // Native rdi..r9 plus nx at 0x10(%rbp): validated is written only after the hash.
 void validatePage(void *vnode,void *pager,uint64_t offset,const void *data,int *validated,int *tainted,int *nx) {
  originalValidate(vnode,pager,offset,data,validated,tainted,nx);
- if(!vnode || !TahoeDescriptor::admitted(data,offset,*validated!=0,*tainted!=0,runningBuild) || !isImage(vnode))return;
- if(MachInfo::setKernelWriting(true,KernelPatcher::kernelWriteLock)!=KERN_SUCCESS)return;
- TahoeDescriptor::apply(static_cast<uint8_t *>(const_cast<void *>(data)));
+ if(!vnode)return;
+ const bool checked=*validated!=0, dirty=*tainted!=0;
+ const bool bridge=TahoeDescriptor::admitted(data,offset,checked,dirty,runningBuild) && pathMatches(vnode,TahoeDescriptor::image);
+ const bool video=!bridge && TahoeDescriptor::videoAdmitted(data,offset,checked,dirty,runningBuild) && pathMatches(vnode,TahoeDescriptor::videoImage);
+ auto site=!bridge && !video ? TahoeDescriptor::driverSite(data,offset,checked,dirty,runningBuild) : nullptr;
+ if(site && !pathMatches(vnode,TahoeDescriptor::driverImage))site=nullptr;
+ if((!bridge && !video && !site) || MachInfo::setKernelWriting(true,KernelPatcher::kernelWriteLock)!=KERN_SUCCESS)return;
+ auto page=static_cast<uint8_t *>(const_cast<void *>(data));
+ if(bridge)TahoeDescriptor::apply(page);
+ else if(video)TahoeDescriptor::applyVideo(page);
+ else TahoeDescriptor::applyDriver(page,*site);
  MachInfo::setKernelWriting(false,KernelPatcher::kernelWriteLock);
- SYSLOG("wex","Tahoe descriptor bridge admitted for %s",runningBuild);
+ SYSLOG("wex","Tahoe %s admitted for %s",bridge ? "descriptor bridge" : video ? "video adapter" : "pixel transfer",runningBuild);
 }
 }
 
