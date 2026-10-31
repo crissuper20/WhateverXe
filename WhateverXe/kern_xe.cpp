@@ -86,7 +86,8 @@
 #include <IOKit/IOBufferMemoryDescriptor.h>
 #include <libkern/c++/OSSerialize.h>
 #include <libkern/c++/OSData.h>
-#include <IOKit/IONVRAM.h> // EXPERIMENT
+#include <IOKit/IODeviceTreeSupport.h> // EXPERIMENT
+#include <IOKit/pwr_mgt/RootDomain.h> // EXPERIMENT
 
 extern "C" const char version[];
 extern "C" void tglHangPreStopWake(void *,bool,unsigned,unsigned,void *);
@@ -4458,20 +4459,41 @@ bool XE::processKext(KernelPatcher &patcher, size_t index, mach_vm_address_t add
 
 static bool adlnWriterMappingBound();
 static uint64_t wexDiagEDP[34]; // DIAG: published with N97FBBootHandoffCheck.
-// EXPERIMENT: one boot only. Off unless armed, and the arm is consumed before native start.
+// EXPERIMENT: one boot only. Userspace turns an arm into a go token naming this boot session.
+// The kernel only reads NVRAM here, so a hang cannot leave anything half written, and any
+// later boot has a different session ID and fails closed.
+extern "C" int sysctlbyname(const char *,void *,size_t *,void *,size_t);
 static bool wexEDPArmed;
-static void wexTakeEDPArm() {
- uint64_t r[4] {1};
+static void wexCheckEDPGo() {
+ // Token: "<session uuid>.<boot seconds>". Any one identity source may match; all of them only read.
+ char session[37] {};size_t length=sizeof(session);uint64_t boot[2] {};size_t bootLength=sizeof(boot);
+ uint64_t r[10] {3};
+ r[1]=static_cast<uint32_t>(sysctlbyname("kern.bootsessionuuid",session,&length,nullptr,0));r[2]=length;
+ r[3]=static_cast<uint32_t>(sysctlbyname("kern.boottime",boot,&bootLength,nullptr,0));r[4]=boot[0];
+ auto domain=IOService::getPMRootDomain();
+ auto pmObject=domain ? domain->copyProperty("BootSessionUUID") : nullptr;
+ auto pm=OSDynamicCast(OSString,pmObject);r[5]=pm!=nullptr;
  auto entry=IORegistryEntry::fromPath("/options",gIODTPlane);
- auto nvram=OSDynamicCast(IODTNVRAM,entry);
- if(nvram && entry->getProperty("wex-edp-arm")) {
-  r[1]=1;entry->removeProperty("wex-edp-arm");nvram->sync();
-  r[2]=!entry->getProperty("wex-edp-arm");wexEDPArmed=r[2]!=0;
+ auto token=entry ? entry->copyProperty("wex-edp-go") : nullptr;
+ auto data=OSDynamicCast(OSData,token);auto text=OSDynamicCast(OSString,token);
+ auto bytes=static_cast<const char *>(data ? data->getBytesNoCopy() : text ? static_cast<const void *>(text->getCStringNoCopy()) : nullptr);
+ const unsigned size=data ? data->getLength() : text ? text->getLength() : 0;
+ r[6]=bytes!=nullptr;
+ if(bytes && size>=36) {
+  r[7]=!r[1] && length>=36 && !memcmp(bytes,session,36);
+  r[8]=pm && pm->getLength()==36 && !memcmp(bytes,pm->getCStringNoCopy(),36);
+  uint64_t seconds=0;bool number=size>37 && bytes[36]=='.';
+  for(unsigned i=37;number && i<size && bytes[i];++i) {
+   if(bytes[i]<'0' || bytes[i]>'9')number=false;
+   else seconds=seconds*10+static_cast<uint64_t>(bytes[i]-'0');
+  }
+  const auto delta=seconds>boot[0] ? seconds-boot[0] : boot[0]-seconds;
+  if(number && !r[3] && boot[0] && delta<=5)r[8]|=2;
  }
- r[3]=wexEDPArmed;
- if(entry)entry->release();
+ wexEDPArmed=r[7] || r[8];r[9]=wexEDPArmed;
+ OSSafeReleaseNULL(token);OSSafeReleaseNULL(entry);OSSafeReleaseNULL(pmObject);
  IORegistryEntry::getRegistryRoot()->setProperty("WEXEDPOnce",r,sizeof(r));
- SYSLOG("igfx","eDP one-shot present=%llu removed=%llu armed=%llu",r[1],r[2],r[3]);
+ SYSLOG("igfx","eDP one-shot sysctl=%llu/%llu time=%llu pm=%llu token=%llu match=%llu/%llu armed=%llu",r[1],r[2],r[3],r[5],r[6],r[7],r[8],r[9]);
 }
 namespace {
 struct Display13GMBusScope {
@@ -8002,7 +8024,7 @@ bool XE::wrapDisplay13FramebufferStart(IOService *that,IOService *provider) {
 		s->orgAlderLakeNSysMemAllocate!=0,s->orgAlderLakeNSysMemFree!=0,display13FBSysMem.lock!=nullptr,display13FBSysMem.retireLock!=nullptr,adlnFixedSysMemEnabled};
 	IORegistryEntry::getRegistryRoot()->setProperty("N97FramebufferDualPolicy",dualPolicy,sizeof(dualPolicy));
 	if(Display13FBTopology::multiOutputWiring(s->adlnOutputWiring) && !dualReady)return false;
-	wexTakeEDPArm(); // EXPERIMENT
+	wexCheckEDPGo(); // EXPERIMENT
 	// Native provider-workloop mode creates/binds the PCI interrupt source in
 	// controller start, rather than waiting for an accelerator or FB open.
 	// This backend supports linear boot surfaces and Y-tiled native scanout,
