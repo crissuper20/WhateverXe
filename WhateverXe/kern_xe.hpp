@@ -169,7 +169,7 @@ private:
  static bool display13StopTranscoder(void *port);
  static bool display13DeferClock(void *access,uint64_t reg,uint32_t value,uintptr_t caller);
 
- static uint8_t *display13SSTPort(void *port);
+ static uint8_t *display13SSTPort(void *port,bool bootPanel=false);
  static bool display13HDMIPort(void *port);
  static uint32_t wrapDisplay13TrainingPattern(void *path,uint32_t pattern);
  static uint32_t wrapDisplay13SignalLevels(void *port,uint32_t swing,uint32_t emphasis,void *overrideConfig);

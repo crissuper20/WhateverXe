@@ -67,7 +67,7 @@ struct XE {
  uintptr_t orgDisplay13EnablePort=0,orgDisplay13DisablePort=0;
  static bool display13MainLinkAUX(void*,bool);
  static uint32_t wrapDisplay13EnablePort(void*);static uint32_t wrapDisplay13DisablePort(void*);
- static uint8_t *display13SSTPort(void*);static bool display13HDMIPort(void*);
+ static uint8_t *display13SSTPort(void*,bool bootPanel=false);static bool display13HDMIPort(void*);
  static uint32_t wrapDisplay13TCSignal(void*,uint32_t,uint32_t,void*){assert(false);return 1;}
  static uint32_t wrapDisplay13SignalLevels(void*,uint32_t,uint32_t,void*);
  static uint32_t wrapDisplay13TrainingPattern(void*,uint32_t);

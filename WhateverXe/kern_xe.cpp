@@ -86,6 +86,7 @@
 #include <IOKit/IOBufferMemoryDescriptor.h>
 #include <libkern/c++/OSSerialize.h>
 #include <libkern/c++/OSData.h>
+#include <IOKit/IONVRAM.h> // EXPERIMENT
 
 extern "C" const char version[];
 extern "C" void tglHangPreStopWake(void *,bool,unsigned,unsigned,void *);
@@ -4456,6 +4457,22 @@ bool XE::processKext(KernelPatcher &patcher, size_t index, mach_vm_address_t add
 }
 
 static bool adlnWriterMappingBound();
+static uint64_t wexDiagEDP[34]; // DIAG: published with N97FBBootHandoffCheck.
+// EXPERIMENT: one boot only. Off unless armed, and the arm is consumed before native start.
+static bool wexEDPArmed;
+static void wexTakeEDPArm() {
+ uint64_t r[4] {1};
+ auto entry=IORegistryEntry::fromPath("/options",gIODTPlane);
+ auto nvram=OSDynamicCast(IODTNVRAM,entry);
+ if(nvram && entry->getProperty("wex-edp-arm")) {
+  r[1]=1;entry->removeProperty("wex-edp-arm");nvram->sync();
+  r[2]=!entry->getProperty("wex-edp-arm");wexEDPArmed=r[2]!=0;
+ }
+ r[3]=wexEDPArmed;
+ if(entry)entry->release();
+ IORegistryEntry::getRegistryRoot()->setProperty("WEXEDPOnce",r,sizeof(r));
+ SYSLOG("igfx","eDP one-shot present=%llu removed=%llu armed=%llu",r[1],r[2],r[3]);
+}
 namespace {
 struct Display13GMBusScope {
     volatile uintptr_t thread {};
@@ -7276,7 +7293,7 @@ bool XE::processDisplay13FramebufferSST(KernelPatcher &patcher,size_t index,mach
 
 // Called with the display owner lock held. The native caller owns the port;
 // require its retained platform record and BAR association before sampling it.
-uint8_t *XE::display13SSTPort(void *port) {
+uint8_t *XE::display13SSTPort(void *port,bool bootPanel) {
  auto s=callbackXE;auto &c=display13FBPower;auto object=static_cast<OSObject *>(port);
  if(!s->display13FramebufferRequested || s->xeProfile.display!=XELP::Display::XeLPD || !s->display13FBSSTHooksReady ||
     !object || object->getMetaClass()->getClassSize()<0x624 || !c.controller ||
@@ -7285,7 +7302,10 @@ uint8_t *XE::display13SSTPort(void *port) {
  auto p=static_cast<uint8_t *>(port);auto config=Display13FBMemory::field<uint32_t *>(p,0x548);
  if(!Display13FBTopology::selected(s->adlnPlatform,config,s->adlnOutputWiring) ||
     !(s->adlnOutputWiring.links()&(1U<<config[0])) || p[0x117] ||
-    Display13FBMemory::field<uint32_t>(p,0x120)!=config[0] || Display13FBMemory::field<uint32_t>(p,0x550)!=(config[0]>=3?4U:1U) ||
+    Display13FBMemory::field<uint32_t>(p,0x120)!=config[0] ||
+    (Display13FBMemory::field<uint32_t>(p,0x550)!=(config[0]>=3?4U:1U) &&
+     // EXPERIMENT: boot GOP adoption can run before native setPortMode.
+     !(bootPanel && config[0]<2 && (s->adlnOutputWiring.panel&(1U<<config[0])) && !Display13FBMemory::field<uint32_t>(p,0x550))) ||
     Display13FBMemory::field<void *>(p,0x578)!=c.access)return nullptr;
  return p;
 }
@@ -7982,6 +8002,7 @@ bool XE::wrapDisplay13FramebufferStart(IOService *that,IOService *provider) {
 		s->orgAlderLakeNSysMemAllocate!=0,s->orgAlderLakeNSysMemFree!=0,display13FBSysMem.lock!=nullptr,display13FBSysMem.retireLock!=nullptr,adlnFixedSysMemEnabled};
 	IORegistryEntry::getRegistryRoot()->setProperty("N97FramebufferDualPolicy",dualPolicy,sizeof(dualPolicy));
 	if(Display13FBTopology::multiOutputWiring(s->adlnOutputWiring) && !dualReady)return false;
+	wexTakeEDPArm(); // EXPERIMENT
 	// Native provider-workloop mode creates/binds the PCI interrupt source in
 	// controller start, rather than waiting for an accelerator or FB open.
 	// This backend supports linear boot surfaces and Y-tiled native scanout,
@@ -8136,7 +8157,47 @@ void XE::wrapAlderLakeNSetupWorkLoop(IOService *controller,IOWorkLoop *workLoop)
                 const auto ddi=c.bridge.bootPort;
                 const bool dp=ddi<7 && (callbackXE->adlnOutputWiring.links()&(1U<<ddi));
                 bool linked=!dp;
-                if(dp && display13SSTPort(port)) {
+                // DIAG: read-only record of each boot eDP adoption precondition.
+                if(ddi<2) {
+                    using namespace Display13Power;
+                    auto s=callbackXE;auto p=reinterpret_cast<uint8_t *>(port);auto config=Display13FBMemory::field<uint32_t *>(p,0x548);
+                    const bool isPanel=(s->adlnOutputWiring.panel&(1U<<ddi))!=0;
+                    Display13FBBootIO diagIO{c.map};auto &snapshot=c.displayScratch;AlderLakeN::readDisplay(diagIO,true,snapshot);
+                    auto &l=c.mainLink[ddi];uint64_t sst=0;
+                    sst|=uint64_t(s->display13FramebufferRequested)<<0;
+                    sst|=uint64_t(s->xeProfile.display==XELP::Display::XeLPD)<<1;
+                    sst|=uint64_t(s->display13FBSSTHooksReady)<<2;
+                    sst|=uint64_t(port->getMetaClass()->getClassSize()>=0x624)<<3;
+                    sst|=uint64_t(c.controller==s->adlnTopologyController)<<4;
+                    sst|=uint64_t(adlnWriterMappingBound())<<5;
+                    sst|=uint64_t(!c.clockFaulted)<<6;sst|=uint64_t(!c.memoryFaulted)<<7;
+                    sst|=uint64_t(!c.panelFaulted)<<8;sst|=uint64_t(!c.clockStopped)<<9;
+                    sst|=uint64_t(s->adlnOutputWiring.described())<<10;
+                    sst|=uint64_t(Display13FBTopology::selected(s->adlnPlatform,config,s->adlnOutputWiring))<<11;
+                    sst|=uint64_t(config && (s->adlnOutputWiring.links()&(1U<<config[0])))<<12;
+                    sst|=uint64_t(!p[0x117])<<13;
+                    sst|=uint64_t(config && Display13FBMemory::field<uint32_t>(p,0x120)==config[0])<<14;
+                    sst|=uint64_t(Display13FBMemory::field<uint32_t>(p,0x550)==1U)<<15;
+                    sst|=uint64_t(Display13FBMemory::field<void *>(p,0x578)==c.access)<<16;
+                    wexDiagEDP[0]=1;wexDiagEDP[1]=sst;wexDiagEDP[2]=p[0x117];wexDiagEDP[3]=Display13FBMemory::field<uint32_t>(p,0x550);
+                    wexDiagEDP[4]=config ? config[0] : UINT64_MAX;wexDiagEDP[5]=Display13FBMemory::field<uint32_t>(p,0x120);
+                    wexDiagEDP[6]=port->getMetaClass()->getClassSize();wexDiagEDP[7]=dp;wexDiagEDP[8]=ddi;wexDiagEDP[9]=isPanel;
+                    wexDiagEDP[10]=l.bootPending;wexDiagEDP[11]=l.owner;wexDiagEDP[12]=l.port;
+                    wexDiagEDP[13]=l.lease.owner==&c.bridge.state;wexDiagEDP[14]=l.lease.domains;
+                    wexDiagEDP[15]=dependencies(auxDomain(ddi));wexDiagEDP[16]=held(diagIO,c.bridge.state,l.lease.domains);
+                    wexDiagEDP[17]=c.bridge.bootPort;wexDiagEDP[18]=c.bridge.bootAdopted;wexDiagEDP[19]=c.bridge.bootPGProtected;
+                    wexDiagEDP[20]=c.bridge.bootDDIProtected;wexDiagEDP[21]=c.bridge.outputHeld(diagIO,ddi,0);
+                    wexDiagEDP[22]=snapshot.activePipes;wexDiagEDP[23]=static_cast<uint32_t>(snapshot.status);
+                    wexDiagEDP[24]=AlderLakeN::dpSource(snapshot,0,ddi,nullptr,isPanel);
+                    wexDiagEDP[25]=AlderLakeN::dpSourceUnchanged(diagIO,snapshot,0,ddi,0,nullptr,isPanel);
+                    uint32_t trans=0,tp=0,buf=0,clock=0,aux=0;
+                    AlderLakeN::value(snapshot,0x60400,trans);AlderLakeN::value(snapshot,0x60540,tp);
+                    AlderLakeN::value(snapshot,0x64000+ddi*0x100,buf);AlderLakeN::value(snapshot,0x46140,clock);
+                    AlderLakeN::value(snapshot,Display13Power::AUX,aux);
+                    wexDiagEDP[26]=trans;wexDiagEDP[27]=tp;wexDiagEDP[28]=buf;wexDiagEDP[29]=clock;wexDiagEDP[30]=aux;
+                    wexDiagEDP[31]=diagIO.read(Display13Power::Driver);
+                }
+                if(dp && display13SSTPort(port,wexEDPArmed)) {
                     Display13FBBootIO io{c.map};auto &boot=c.displayScratch;AlderLakeN::readDisplay(io,true,boot);
                     if(ddi>=3) {
                         const auto source=Display13TC::Boot::capture(io,true,ddi,0);
@@ -8149,8 +8210,10 @@ void XE::wrapAlderLakeNSetupWorkLoop(IOService *controller,IOWorkLoop *workLoop)
                         if(linked)port->retain(); // Released only after real buffer stop/idle.
                     }
                 }
+                wexDiagEDP[32]=linked; // DIAG
                 if(linked)result=c.bridge.adoptBootPath(reinterpret_cast<uintptr_t>(path),0,ddi);
                 else result.status=Display13Power::Status::NotReady;
+                wexDiagEDP[33]=static_cast<uint32_t>(result.status); // DIAG
             }
 			else if(c.bridge.bootPath==reinterpret_cast<uintptr_t>(path))result.status=Display13Power::Status::Complete;
 			if(result.status==Display13Power::Status::Complete &&
@@ -8164,6 +8227,7 @@ void XE::wrapAlderLakeNSetupWorkLoop(IOService *controller,IOWorkLoop *workLoop)
 	if(result.status!=Display13Power::Status::Complete && adlnIRQOwner(controller))wrapDisplay13FBDisableIRQ(controller);
 	adlnPublishPowerRecord("N97FBBootHandoff",record);
 	IORegistryEntry::getRegistryRoot()->setProperty("N97FBBootHandoffCheck",check,sizeof(check));
+	IORegistryEntry::getRegistryRoot()->setProperty("WEXEDPHandoffDiag",wexDiagEDP,sizeof(wexDiagEDP)); // DIAG
 }
 
 bool XE::wrapAlderLakeNScanoutAllocate(IOService *fb) {
