@@ -387,11 +387,24 @@ static bool tglCorrectCCSAlignment(uint32_t *w) {
  w[0]|=0x8000U;
  return true;
 }
+// The OpenGL blit library resolves multisampled colour with aux mode 5, trusting metadata the
+// samples were not drawn with, while plain reads of the same surface use no aux and are correct.
+static bool tglClearResolveSourceAux(uint32_t *w) {
+ if (!((w[4]>>3)&7U) || (w[6]&7U)!=5) return false;
+ w[6]&=~7U;
+ return true;
+}
 uint32_t tglCCSAlignmentCounts[3] {}; // calls, CCS_E states, corrected
 bool tglCCSAlignmentSerialize(void *,void *,OSSerialize *serializer) {
  uint32_t out[4] {127};
  for (unsigned i=0;i<3;++i) out[i+1]=__atomic_load_n(&tglCCSAlignmentCounts[i],__ATOMIC_RELAXED);
  auto data=OSData::withBytes(out,sizeof(out));if (!data) return false;
+ const bool ok=data->serialize(serializer);data->release();return ok;
+}
+// Read-only census of relocated surface states: aux mode by tiling, intent, format.
+struct {uint32_t revision,auxTile[8][4],intent[8],format[1024];} tglSurfaceCounts {2};
+bool tglSurfaceCountsSerialize(void *,void *,OSSerialize *serializer) {
+ auto data=OSData::withBytes(&tglSurfaceCounts,sizeof(tglSurfaceCounts));if (!data) return false;
  const bool ok=data->serialize(serializer);data->release();return ok;
 }
 // r140: a native-owned GGTT batch runs after RCS context restore. Unlike the
@@ -11154,8 +11167,12 @@ bool XE::processTGLAccelerator(KernelPatcher &patcher, size_t index, mach_vm_add
 			}
 			patcher.clearError();
 			IORegistryEntry::getRegistryRoot()->setProperty("TGLCCSAlignmentReady",auxAlignOK);
+			if (routeTGLBlitLib(patcher,index,address,size)) IORegistryEntry::getRegistryRoot()->setProperty("TGLBlitLibAuxReady",kOSBooleanTrue);
 			if (auto live=OSSerializer::forTarget(nullptr,tglCCSAlignmentSerialize)) {
 				IORegistryEntry::getRegistryRoot()->setProperty("TGLCCSAlignmentLive",live);live->release();
+			}
+			if (auto live=OSSerializer::forTarget(nullptr,tglSurfaceCountsSerialize)) {
+				IORegistryEntry::getRegistryRoot()->setProperty("TGLSurfaceCounts",live);live->release();
 			}
 			// Keep IOSurface device-cache allocation uncompressed. The donor
 			// enables it again when the last external display disappears, even
@@ -14964,9 +14981,46 @@ void XE::wrapTGLHangRingDump(void *ring,void *registers) {
  FunctionCast(wrapTGLHangRingDump,callbackXE->orgTGLHangRingDump)(ring,registers);
 }
 
+__attribute__((noinline)) bool XE::routeTGLBlitLib(KernelPatcher &patcher,size_t index,mach_vm_address_t address,size_t size) {
+ const char *setup="__ZN16IGAccelGLContext28process_token_BlitLibSetup3DER24IOAccelCommandStreamInfo";
+ // The routed head, then the driver's own reads of the fields used by the wrapper.
+ const uint8_t head[] {0x55,0x48,0x89,0xE5,0x41,0x57,0x41,0x56,0x41,0x55,0x41,0x54,0x53,0x48,0x83,0xEC,0x28,
+  0x49,0x89,0xFE,0x4C,0x8B,0x6E,0x18,0x80,0x7E,0x3C,0x00};
+ const uint8_t size_[] {0x49,0x8B,0x86,0xB0,0x12,0,0},buffer[] {0x49,0x8B,0xBE,0xA8,0x12,0,0},map[] {0xFF,0x90,0x18,0x01,0,0};
+ bool ready=size>0x6254D &&
+  patcher.solveSymbol<mach_vm_address_t>(index,setup,address,size)==address+0x623E8 &&
+  !memcmp(reinterpret_cast<void *>(address+0x623E8),head,sizeof(head)) &&
+  !memcmp(reinterpret_cast<void *>(address+0x6240D),size_,sizeof(size_)) &&
+  !memcmp(reinterpret_cast<void *>(address+0x6253D),buffer,sizeof(buffer)) &&
+  !memcmp(reinterpret_cast<void *>(address+0x62547),map,sizeof(map));
+ if (ready) {
+  KernelPatcher::RouteRequest route[] {{setup,wrapTGLBlitLibSetup3D,orgTGLBlitLibSetup3D}};
+  ready=patcher.routeMultiple(index,route,arrsize(route),address,size);
+ }
+ patcher.clearError();
+ return ready;
+}
+uint64_t XE::wrapTGLBlitLibSetup3D(void *context,void *stream) {
+ auto c=static_cast<uint8_t *>(context);
+ auto s=static_cast<uint8_t *>(stream);
+ uint32_t source=0;
+ const bool hasSurfaces=s[0x3C];
+ if (hasSurfaces) memcpy(&source,*reinterpret_cast<uint8_t **>(s+0x18)+0x18,sizeof(source));
+ const auto result=FunctionCast(wrapTGLBlitLibSetup3D,callbackXE->orgTGLBlitLibSetup3D)(context,stream);
+ auto buffer=*reinterpret_cast<void **>(c+0x12A8);
+ const auto size=*reinterpret_cast<uint64_t *>(c+0x12B0);
+ if (hasSurfaces && buffer && source+64ULL<=size) {
+  auto base=reinterpret_cast<uint8_t *(*)(void *)>((*reinterpret_cast<uintptr_t **>(buffer))[0x118/sizeof(uintptr_t)])(buffer);
+  tglClearResolveSourceAux(reinterpret_cast<uint32_t *>(base+source));
+ }
+ return result;
+}
 void XE::wrapTGLSurfaceAux(void *resource,void *entry,uint32_t *surface,uint32_t intent) {
  FunctionCast(wrapTGLSurfaceAux,callbackXE->orgTGLSurfaceAux)(resource,entry,surface,intent);
  __atomic_fetch_add(&tglCCSAlignmentCounts[0],1,__ATOMIC_RELAXED);
+ __atomic_fetch_add(&tglSurfaceCounts.auxTile[surface[6]&7U][(surface[0]>>12)&3U],1,__ATOMIC_RELAXED);
+ __atomic_fetch_add(&tglSurfaceCounts.intent[intent&7U],1,__ATOMIC_RELAXED);
+ __atomic_fetch_add(&tglSurfaceCounts.format[(surface[0]>>18)&0x3FFU],1,__ATOMIC_RELAXED);
  if ((surface[6]&7U)==5) __atomic_fetch_add(&tglCCSAlignmentCounts[1],1,__ATOMIC_RELAXED);
  if (tglCorrectCCSAlignment(surface)) __atomic_fetch_add(&tglCCSAlignmentCounts[2],1,__ATOMIC_RELAXED);
 }

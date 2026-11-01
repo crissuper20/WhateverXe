@@ -692,6 +692,9 @@ private:
 	mach_vm_address_t orgTGLBlitDeferredInit {};
 	static void wrapTGLBlitDeferredInit(void *context,void *params,const void *rects);
 	mach_vm_address_t orgTGLSurfaceAux {};
+	mach_vm_address_t orgTGLBlitLibSetup3D {};
+	bool routeTGLBlitLib(KernelPatcher &patcher, size_t index, mach_vm_address_t address, size_t size);
+	static uint64_t wrapTGLBlitLibSetup3D(void *context, void *stream);
 	static void wrapTGLSurfaceAux(void *resource, void *entry, uint32_t *surface, uint32_t intent);
 	mach_vm_address_t orgTGLHangRingDump {};
 	static void wrapTGLHangRingDump(void *ring, void *registers);

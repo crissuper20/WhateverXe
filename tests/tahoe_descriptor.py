@@ -92,17 +92,46 @@ int main(int argc,char **argv) {
   assert(!memcmp(page+site.offset,site.after,site.size));
   assert(!driverSite(page,site.page,true,false,"25G332"));
  }
- // The rewritten block keeps the null branch: mov;mov;test;je +0xc;nop;nop before 0x1b1d55.
- {auto &a=driverSites[0];assert(a.after[17]==0x74 && a.after[18]==0x0c && 0x1b1d40+19+a.after[18]==0x1b1d5f && a.size==21);}
+ // The rewritten block stores slot 2, then jumps to the failure path at 0x1b1d5f.
+ {auto &a=driverSites[0];assert(a.after[7]==0xe9 && 0x1b1d40+12+a.after[8]==0x1b1d5f && !a.after[9] && !a.after[10] && !a.after[11] && a.size==21);
+  for(size_t i=12;i<a.size;++i)assert(a.after[i]==0x90);}
  assert(driverImage("/System/Volumes/Data/Library/GPUBundles/AppleIntelTGLGraphicsVADriver.bundle/Contents/MacOS/AppleIntelTGLGraphicsVADriver"));
  assert(!driverImage("/Library/GPUBundles/AppleIntelTGLGraphicsVADriver.bundle/Contents/MacOS/TGLVA"));
  assert(!driverImage(nullptr));
  if(argc>3) {
   for(auto &site:driverSites) {
    FILE *f=fopen(argv[3],"rb"); assert(f); assert(!fseek(f,site.page,SEEK_SET)); assert(fread(page,1,sizeof(page),f)==sizeof(page)); fclose(f);
-   assert(driverSite(page,site.page,true,false,"25G332")==&site || !memcmp(page+site.offset,site.after,site.size));
+   // A running system may still hold the earlier build's pages until it reboots.
+   const uint8_t earlier[]={0x48,0x89,0x81,0x20,0x09,0x00,0x00,0x48,0x89,0x81,0x10,0x09,0x00,0x00,0x48,0x85,0xc0,0x74,0x0c,0x90,0x90};
+   assert(driverSite(page,site.page,true,false,"25G332")==&site || !memcmp(page+site.offset,site.after,site.size) || (site.page==0x1b1000 && !memcmp(page+site.offset,earlier,sizeof(earlier))));
   }
   puts("PASS: installed video driver satisfies both pixel-transfer sites");
+ }
+ // GPU counter site: same rules as the transfer sites.
+ const uint64_t metalPage=metalSites[0].page;
+ auto freshMetal=[]{memset(page,0x90,sizeof(page)); for(auto &s:metalSites)memcpy(page+s.offset,s.before,s.size);};
+ freshMetal();
+ assert(metalAdmitted(page,metalPage,true,false,"25G332"));
+ assert(!metalAdmitted(page,metalPage+0x1000,true,false,"25G332"));
+ assert(!metalAdmitted(page,metalPage,true,false,"25G241"));
+ assert(!metalAdmitted(page,metalPage,false,false,"25G332"));
+ assert(!metalAdmitted(page,metalPage,true,true,"25G332"));
+ assert(!metalAdmitted(nullptr,metalPage,true,false,"25G332"));
+ for(auto &s:metalSites) for(size_t i=0;i<s.size;++i) {
+  freshMetal(); page[s.offset+i]^=0xff;
+  assert(!metalAdmitted(page,metalPage,true,false,"25G332"));
+ }
+ freshMetal(); applyMetal(page);
+ for(auto &s:metalSites) assert(page[s.offset]==0x31 && page[s.offset+1]==0xc0 && page[s.offset+2]==0xc3);
+ assert(!metalAdmitted(page,metalPage,true,false,"25G332"));
+ assert(metalImage("/System/Volumes/Data/Library/GPUBundles/AppleIntelTGLGraphicsMTLDriver.bundle/Contents/MacOS/AppleIntelTGLGraphicsMTLDriver"));
+ assert(!metalImage("/Library/GPUBundles/AppleIntelTGLGraphicsMTLDriver.bundle/Contents/MacOS/impostor.dylib"));
+ assert(!metalImage(nullptr));
+ if(argc>4) {
+  FILE *f=fopen(argv[4],"rb"); assert(f); assert(!fseek(f,metalPage,SEEK_SET)); assert(fread(page,1,sizeof(page),f)==sizeof(page)); fclose(f);
+  // A running system may hold the earlier build, which changed only the first site.
+  for(auto &s:metalSites) assert(!memcmp(page+s.offset,s.before,s.size) || !memcmp(page+s.offset,s.after,s.size));
+  puts("PASS: installed Metal driver satisfies the counter sites");
  }
  puts("PASS: descriptor gates are exact, validated-only and build-bound");
 }
@@ -113,4 +142,5 @@ with tempfile.TemporaryDirectory(prefix='tahoe-descriptor-') as temp:
     subprocess.run(['clang++','-std=c++17','-I',str(root/'WhateverXe'),str(p/'t.cpp'),'-o',str(p/'t')],check=True)
     video = pathlib.Path('/Library/GPUBundles/AppleIntelTGLGraphicsVADriver.bundle/Contents/MacOS/TGLVA')
     driver = video.with_name('AppleIntelTGLGraphicsVADriver')
-    subprocess.run([str(p/'t')]+([str(installed),str(video),str(driver)] if installed.exists() and video.exists() and driver.exists() else []),check=True)
+    metal = installed.with_name('AppleIntelTGLGraphicsMTLDriver')
+    subprocess.run([str(p/'t')]+([str(installed),str(video),str(driver),str(metal)] if installed.exists() and video.exists() and driver.exists() and metal.exists() else []),check=True)

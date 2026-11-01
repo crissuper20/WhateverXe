@@ -28,13 +28,15 @@ void validatePage(void *vnode,void *pager,uint64_t offset,const void *data,int *
  const bool video=!bridge && TahoeDescriptor::videoAdmitted(data,offset,checked,dirty,runningBuild) && pathMatches(vnode,TahoeDescriptor::videoImage);
  auto site=!bridge && !video ? TahoeDescriptor::driverSite(data,offset,checked,dirty,runningBuild) : nullptr;
  if(site && !pathMatches(vnode,TahoeDescriptor::driverImage))site=nullptr;
- if((!bridge && !video && !site) || MachInfo::setKernelWriting(true,KernelPatcher::kernelWriteLock)!=KERN_SUCCESS)return;
+ const bool metal=!bridge && !video && !site && TahoeDescriptor::metalAdmitted(data,offset,checked,dirty,runningBuild) && pathMatches(vnode,TahoeDescriptor::metalImage);
+ if((!bridge && !video && !site && !metal) || MachInfo::setKernelWriting(true,KernelPatcher::kernelWriteLock)!=KERN_SUCCESS)return;
  auto page=static_cast<uint8_t *>(const_cast<void *>(data));
  if(bridge)TahoeDescriptor::apply(page);
  else if(video)TahoeDescriptor::applyVideo(page);
+ else if(metal)TahoeDescriptor::applyMetal(page);
  else TahoeDescriptor::applyDriver(page,*site);
  MachInfo::setKernelWriting(false,KernelPatcher::kernelWriteLock);
- SYSLOG("wex","Tahoe %s admitted for %s",bridge ? "descriptor bridge" : video ? "video adapter" : "pixel transfer",runningBuild);
+ SYSLOG("wex","Tahoe %s admitted for %s",bridge ? "descriptor bridge" : video ? "video adapter" : metal ? "GPU counters" : "pixel transfer",runningBuild);
 }
 }
 
@@ -51,5 +53,7 @@ void TahoeDescriptor::processKernel(KernelPatcher &p) {
   p.clearError();
  }
  IORegistryEntry::getRegistryRoot()->setProperty("WhateverXeTahoeDescriptor",ready);
+ if(ready)IORegistryEntry::getRegistryRoot()->setProperty("WhateverXeVideoTransfer","software");
  SYSLOG("wex","Tahoe descriptor hook ready=%d",ready);
+ if(ready)SYSLOG("wex","video pixel transfer has no hardware path: software conversion in use");
 }
