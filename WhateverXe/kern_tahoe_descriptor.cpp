@@ -33,10 +33,10 @@ void validatePage(void *vnode,void *pager,uint64_t offset,const void *data,int *
  auto page=static_cast<uint8_t *>(const_cast<void *>(data));
  if(bridge)TahoeDescriptor::apply(page);
  else if(video)TahoeDescriptor::applyVideo(page);
- else if(metal)TahoeDescriptor::applyMetal(page);
+ else if(metal)TahoeDescriptor::applyMetal(page,offset);
  else TahoeDescriptor::applyDriver(page,*site);
  MachInfo::setKernelWriting(false,KernelPatcher::kernelWriteLock);
- SYSLOG("wex","Tahoe %s admitted for %s",bridge ? "descriptor bridge" : video ? "video adapter" : metal ? "GPU counters" : "pixel transfer",runningBuild);
+ SYSLOG("wex","Tahoe %s admitted for %s page %llx",bridge ? "descriptor bridge" : video ? "video adapter" : metal ? "Metal driver" : "pixel transfer",runningBuild,offset);
 }
 }
 

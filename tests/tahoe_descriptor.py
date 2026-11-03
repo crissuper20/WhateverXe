@@ -107,31 +107,41 @@ int main(int argc,char **argv) {
   }
   puts("PASS: installed video driver satisfies both pixel-transfer sites");
  }
- // GPU counter site: same rules as the transfer sites.
- const uint64_t metalPage=metalSites[0].page;
- auto freshMetal=[]{memset(page,0x90,sizeof(page)); for(auto &s:metalSites)memcpy(page+s.offset,s.before,s.size);};
- freshMetal();
- assert(metalAdmitted(page,metalPage,true,false,"25G332"));
- assert(!metalAdmitted(page,metalPage+0x1000,true,false,"25G332"));
- assert(!metalAdmitted(page,metalPage,true,false,"25G241"));
- assert(!metalAdmitted(page,metalPage,false,false,"25G332"));
- assert(!metalAdmitted(page,metalPage,true,true,"25G332"));
- assert(!metalAdmitted(nullptr,metalPage,true,false,"25G332"));
- for(auto &s:metalSites) for(size_t i=0;i<s.size;++i) {
-  freshMetal(); page[s.offset+i]^=0xff;
+ // Metal driver sites: each page is admitted only with all of its own sites, the others are ignored.
+ const uint64_t metalPages[]={0x26000,0x7e000};
+ for(uint64_t metalPage:metalPages) {
+  auto freshMetal=[&]{memset(page,0x90,sizeof(page)); for(auto &s:metalSites) if(s.page==metalPage) memcpy(page+s.offset,s.before,s.size);};
+  freshMetal();
+  assert(metalAdmitted(page,metalPage,true,false,"25G332"));
+  assert(!metalAdmitted(page,metalPage+0x1000,true,false,"25G332"));
+  assert(!metalAdmitted(page,metalPage,true,false,"25G241"));
+  assert(!metalAdmitted(page,metalPage,false,false,"25G332"));
+  assert(!metalAdmitted(page,metalPage,true,true,"25G332"));
+  assert(!metalAdmitted(nullptr,metalPage,true,false,"25G332"));
+  for(auto &s:metalSites) if(s.page==metalPage) for(size_t i=0;i<s.size;++i) {
+   freshMetal(); page[s.offset+i]^=0xff;
+   assert(!metalAdmitted(page,metalPage,true,false,"25G332"));
+  }
+  freshMetal(); applyMetal(page,metalPage);
+  for(auto &s:metalSites) if(s.page==metalPage) assert(!memcmp(page+s.offset,s.after,s.size));
   assert(!metalAdmitted(page,metalPage,true,false,"25G332"));
  }
- freshMetal(); applyMetal(page);
- for(auto &s:metalSites) assert(page[s.offset]==0x31 && page[s.offset+1]==0xc0 && page[s.offset+2]==0xc3);
- assert(!metalAdmitted(page,metalPage,true,false,"25G332"));
+ // The counter sites return nil at entry; the posh site only drops the jne that skips the delete.
+ for(auto &s:metalSites) if(s.page==0x26000) assert(s.after[0]==0x31 && s.after[1]==0xc0 && s.after[2]==0xc3);
+ for(auto &s:metalSites) if(s.page==0x7e000) {
+  for(size_t i=0;i<s.size;++i) if(i!=5 && i!=6) assert(s.before[i]==s.after[i]);
+  assert(s.before[5]==0x75 && s.after[5]==0x66 && s.after[6]==0x90);
+ }
+ assert(!metalAdmitted(page,0x30000,true,false,"25G332"));
  assert(metalImage("/System/Volumes/Data/Library/GPUBundles/AppleIntelTGLGraphicsMTLDriver.bundle/Contents/MacOS/AppleIntelTGLGraphicsMTLDriver"));
  assert(!metalImage("/Library/GPUBundles/AppleIntelTGLGraphicsMTLDriver.bundle/Contents/MacOS/impostor.dylib"));
  assert(!metalImage(nullptr));
  if(argc>4) {
-  FILE *f=fopen(argv[4],"rb"); assert(f); assert(!fseek(f,metalPage,SEEK_SET)); assert(fread(page,1,sizeof(page),f)==sizeof(page)); fclose(f);
-  // A running system may hold the earlier build, which changed only the first site.
-  for(auto &s:metalSites) assert(!memcmp(page+s.offset,s.before,s.size) || !memcmp(page+s.offset,s.after,s.size));
-  puts("PASS: installed Metal driver satisfies the counter sites");
+  for(uint64_t metalPage:metalPages) {
+   FILE *f=fopen(argv[4],"rb"); assert(f); assert(!fseek(f,metalPage,SEEK_SET)); assert(fread(page,1,sizeof(page),f)==sizeof(page)); fclose(f);
+   for(auto &s:metalSites) if(s.page==metalPage) assert(!memcmp(page+s.offset,s.before,s.size) || !memcmp(page+s.offset,s.after,s.size));
+  }
+  puts("PASS: installed Metal driver satisfies the counter and posh sites");
  }
  puts("PASS: descriptor gates are exact, validated-only and build-bound");
 }

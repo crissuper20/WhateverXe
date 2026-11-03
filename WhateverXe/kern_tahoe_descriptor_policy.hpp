@@ -87,6 +87,10 @@ inline void applyDriver(uint8_t *page,const DriverSite &site) {memcpy(page+site.
 // and the method's error path writes through a caller's null error pointer.
 // -[MTLIGAccelDevice counterSets] and -newCounterSampleBufferWithDescriptor:error:
 // both return nil, so no client reaches either path.
+// Every command buffer that is the queue's only active one allocates a 0x12010-byte
+// posh object, and dealloc skips deleting it for such a buffer as if the queue owned it.
+// The queue's pointer is set to null once and never written, so it owns none and
+// WindowServer leaks 76 KB per frame. Always delete it: drop the jne after the test.
 constexpr DriverSite metalSites[] {
  {0x26000,0x86d,16,
   {0x55,0x48,0x89,0xe5,0x41,0x57,0x41,0x56,0x41,0x55,0x41,0x54,0x53,0x48,0x81,0xec},
@@ -94,15 +98,23 @@ constexpr DriverSite metalSites[] {
  {0x26000,0xc6c,16,
   {0x55,0x48,0x89,0xe5,0x41,0x57,0x41,0x56,0x41,0x55,0x41,0x54,0x53,0x48,0x81,0xec},
   {0x31,0xc0,0xc3,0xe5,0x41,0x57,0x41,0x56,0x41,0x55,0x41,0x54,0x53,0x48,0x81,0xec}},
+ {0x7e000,0xd82,16,
+  {0x41,0x80,0x3c,0x06,0x00,0x75,0x0d,0xe8,0x7a,0xfa,0x01,0x00,0x49,0xc7,0x04,0x1e},
+  {0x41,0x80,0x3c,0x06,0x00,0x66,0x90,0xe8,0x7a,0xfa,0x01,0x00,0x49,0xc7,0x04,0x1e}},
 };
 inline bool metalImage(const char *path) {
  return path && !strcmp(stripData(path),"/Library/GPUBundles/AppleIntelTGLGraphicsMTLDriver.bundle/Contents/MacOS/AppleIntelTGLGraphicsMTLDriver");
 }
+// A page is admitted when it holds sites and every one of them matches.
 inline bool metalAdmitted(const void *page,uint64_t offset,bool validated,bool tainted,const char *build) {
- if(offset!=metalSites[0].page || !page || !validated || tainted || !build || strcmp(build,supportedBuild))return false;
- for(const auto &site:metalSites)
+ if(!page || !validated || tainted || !build || strcmp(build,supportedBuild))return false;
+ bool any=false;
+ for(const auto &site:metalSites) {
+  if(site.page!=offset)continue;
   if(memcmp(static_cast<const uint8_t *>(page)+site.offset,site.before,site.size))return false;
- return true;
+  any=true;
+ }
+ return any;
 }
-inline void applyMetal(uint8_t *page) {for(const auto &site:metalSites)applyDriver(page,site);}
+inline void applyMetal(uint8_t *page,uint64_t offset) {for(const auto &site:metalSites)if(site.page==offset)applyDriver(page,site);}
 }
