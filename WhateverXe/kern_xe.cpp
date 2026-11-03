@@ -394,6 +394,32 @@ static bool tglClearResolveSourceAux(uint32_t *w) {
  w[6]&=~7U;
  return true;
 }
+// A Metal render pass stores depth with a deferred resolve, which the next reader runs: the render
+// and compute binders check the subresource's pending bit, replay, and resolve. Both then skip it
+// unless the resource itself has HiZ (+0x19C), which a heap's buffer never has, so heap depth is
+// sampled still compressed. Drop that skip; submitDepthResolve still returns early without HiZ in
+// the entry. Each site: the pending check, the +0x19C test and its je, the replay setup.
+struct TGLHeapDepthGate {uint32_t offset; uint8_t before[16],after[16];};
+static const TGLHeapDepthGate tglHeapDepthGates[2] {
+ {0x500C1,{0x41,0x83,0xBF,0x9C,0x01,0x00,0x00,0x00,0x74,0x4A,0x48,0x8B,0xBD,0x30,0xFF,0xFF}, // render, after isAnyFaceRenderDirty
+          {0x41,0x83,0xBF,0x9C,0x01,0x00,0x00,0x00,0x66,0x90,0x48,0x8B,0xBD,0x30,0xFF,0xFF}},
+ {0x6C402,{0x0F,0xA3,0xC8,0x73,0x43,0x83,0xBF,0x9C,0x01,0x00,0x00,0x00,0x74,0x3A,0x48,0x8B}, // compute, pending bit
+          {0x0F,0xA3,0xC8,0x73,0x43,0x83,0xBF,0x9C,0x01,0x00,0x00,0x00,0x66,0x90,0x48,0x8B}},
+};
+static bool tglPatchHeapDepthGates(KernelPatcher &patcher,mach_vm_address_t address,size_t size) {
+ bool ready=true;
+ for (auto &gate:tglHeapDepthGates)
+  ready=ready && size>gate.offset+sizeof(gate.before) && !memcmp(reinterpret_cast<void *>(address+gate.offset),gate.before,sizeof(gate.before));
+ for (unsigned i=0;ready && i<arrsize(tglHeapDepthGates);++i) {
+  auto &gate=tglHeapDepthGates[i];
+  auto site=reinterpret_cast<uint8_t *>(address+gate.offset);
+  KernelPatcher::LookupPatch patch {&kextIntelTGL,gate.before,gate.after,sizeof(gate.before),1};
+  patcher.applyLookupPatch(&patch,site,sizeof(gate.before)+1);
+  ready=!memcmp(site,gate.after,sizeof(gate.after));patcher.clearError();
+ }
+ SYSLOG("igfx","heap depth resolve gates ready=%d",ready);
+ return ready;
+}
 uint32_t tglCCSAlignmentCounts[3] {}; // calls, CCS_E states, corrected
 bool tglCCSAlignmentSerialize(void *,void *,OSSerialize *serializer) {
  uint32_t out[4] {127};
@@ -11168,6 +11194,7 @@ bool XE::processTGLAccelerator(KernelPatcher &patcher, size_t index, mach_vm_add
 			patcher.clearError();
 			IORegistryEntry::getRegistryRoot()->setProperty("TGLCCSAlignmentReady",auxAlignOK);
 			if (routeTGLBlitLib(patcher,index,address,size)) IORegistryEntry::getRegistryRoot()->setProperty("TGLBlitLibAuxReady",kOSBooleanTrue);
+			IORegistryEntry::getRegistryRoot()->setProperty("TGLHeapDepthGatesReady",tglPatchHeapDepthGates(patcher,address,size));
 			if (auto live=OSSerializer::forTarget(nullptr,tglCCSAlignmentSerialize)) {
 				IORegistryEntry::getRegistryRoot()->setProperty("TGLCCSAlignmentLive",live);live->release();
 			}
