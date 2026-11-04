@@ -288,6 +288,8 @@ static bool tglBlitDeferredSerialize(void *,void *,OSSerialize *serializer) {
 namespace {
 uint32_t tglRecoveryCalls {}, tglRecoveryReturns {};
 uint64_t tglRecoveryRecords[16][16] {};
+TGLRecovery::Snapshot tglRecoverySnapshot {};
+void (*tglRecoveryForceWake)(void *,bool,uint32_t) {};
 bool tglRecoverySerialize(void *,void *,OSSerialize *serializer) {
 	uint64_t data[2+16*16] {};
 	data[0]=__atomic_load_n(&tglRecoveryCalls,__ATOMIC_ACQUIRE);
@@ -301,19 +303,131 @@ bool tglRecoverySerialize(void *,void *,OSSerialize *serializer) {
 }
 }
 
+// EXPERIMENT: which registers a GPU reset changes. The first recovery call
+// reads these ranges under forcewake before the reset and after the native
+// reset and replay, and publishes every register that differs. Read only.
+constexpr uint32_t tglDiffRanges[][2] {
+	{0x0D00,0x0E00},{0x2000,0x2800},{0x4000,0x4200},{0x7000,0x7400},{0x9000,0x9600},{0xA000,0xA300},
+	{0xB000,0xB200},{0xC800,0xD000},{0xE000,0xE800},{0x14800,0x14900},{0x1A000,0x1A600}};
+constexpr unsigned tglDiffCount=3136;
+uint32_t tglDiffBefore[tglDiffCount] {},tglDiffAfter[tglDiffCount] {};
+uint32_t tglDiffState {};
+void tglDiffRead(uint8_t *mmio,uint32_t *out) {
+	unsigned n=0;
+	for (auto &r : tglDiffRanges) for (uint32_t reg=r[0];reg<r[1] && n<tglDiffCount;reg+=4) out[n++]=TGLRecovery::read(mmio,reg);
+}
+uint32_t tglDiffOut[1+3*768] {};
+bool tglDiffSerialize(void *,void *,OSSerialize *serializer) {
+	auto data=tglDiffOut;
+	data[0]=__atomic_load_n(&tglDiffState,__ATOMIC_ACQUIRE);
+	unsigned n=0,i=0;
+	if (data[0]==2) for (auto &r : tglDiffRanges) for (uint32_t reg=r[0];reg<r[1] && i<tglDiffCount;reg+=4,++i)
+		if (tglDiffBefore[i]!=tglDiffAfter[i] && n<768) {data[1+n*3]=reg;data[2+n*3]=tglDiffBefore[i];data[3+n*3]=tglDiffAfter[i];++n;}
+	auto out=OSData::withBytes(data,(1+n*3)*sizeof(uint32_t));if (!out) return false;
+	const bool ok=out->serialize(serializer);out->release();return ok;
+}
+
+// EXPERIMENT: GPU reset evidence. The native save/restore list of the reset
+// ring (ring+0x78: count, entries at +0x10, 0x24 bytes each, register first),
+// its reset mask and engine, recorded once per recovery call. Read only.
+uint64_t tglRecoveryTable[16][48] {};
+bool tglRecoveryTableSerialize(void *,void *,OSSerialize *serializer) {
+	auto out=OSData::withBytes(tglRecoveryTable,sizeof(tglRecoveryTable));if (!out) return false;
+	const bool ok=out->serialize(serializer);out->release();return ok;
+}
+void tglRecoveryTableSample(unsigned n,void *channel) {
+	if (n>=arrsize(tglRecoveryTable)) return;
+	auto q=tglRecoveryTable[n];
+	auto ring=TGLRecovery::field<uint8_t *>(channel,0x130);
+	q[1]=ring[0x40];q[2]=TGLRecovery::field<uint32_t>(ring,0x70);
+	auto table=TGLRecovery::field<uint8_t *>(ring,0x78);
+	const uint64_t count=table ? TGLRecovery::field<uint64_t>(table,0) : 0;
+	auto entries=table ? TGLRecovery::field<uint8_t *>(table,0x10) : nullptr;
+	q[3]=count;
+	for (uint64_t i=0;entries && i<count && i<44;++i)
+		q[4+i]=TGLRecovery::field<uint32_t>(entries,i*0x24)|uint64_t(TGLRecovery::field<uint32_t>(entries,i*0x24+4))<<32;
+	q[0]=1;
+}
+
+// EXPERIMENT: release work lost in a GPU reset. IGAccelEventMachine::eventTimeout
+// returns the context to reset, or 0 after it resumed an engine that has nothing
+// running. Its caller then waits again, so a stamp whose work died in a reset is
+// waited on forever, by the dead process's terminate thread (commandQueueStop ->
+// finishEvent) while it holds a lock WindowServer needs. IOAccelEventMachineFast2
+// keeps, per stamp index, the last issued stamp at +0xFC+index*24 and reads the
+// completed one through the pointer table at +0x28. When eventTimeout returns 0
+// twice in a row for an index that is still behind with no progress, store the
+// issued stamp as completed. No family calls: finishStamp restarts the channel.
+struct TGLStall { uint32_t done, strikes; };
+TGLStall tglStall[128] {};
+uint64_t tglFinishRecords[16][4] {};
+uint32_t tglFinishCount {};
+bool tglFinishSerialize(void *,void *,OSSerialize *serializer) {
+	uint64_t data[1+16*4] {__atomic_load_n(&tglFinishCount,__ATOMIC_ACQUIRE)};
+	memcpy(data+1,tglFinishRecords,sizeof(tglFinishRecords));
+	auto out=OSData::withBytes(data,sizeof(data));if (!out) return false;
+	const bool ok=out->serialize(serializer);out->release();return ok;
+}
+uint64_t XE::wrapTGLEventTimeout(void *machine,int index) {
+	const auto result=FunctionCast(wrapTGLEventTimeout,callbackXE->orgTGLEventTimeout)(machine,index);
+	if (index<0 || index>=static_cast<int>(arrsize(tglStall))) return result;
+	auto m=static_cast<uint8_t *>(machine);
+	auto table=*reinterpret_cast<volatile uint32_t ***>(m+0x28);
+	auto slot=table ? table[index] : nullptr;
+	if (!slot) return result;
+	const auto issued=*reinterpret_cast<uint32_t *>(m+0xFC+index*24);
+	const auto done=*slot;
+	auto &s=tglStall[index];
+	if (result || static_cast<int32_t>(issued-done)<=0 || done!=s.done) {s={done,0};return result;}
+	if (++s.strikes<2) return result;
+	s={issued,0};
+	*slot=issued;
+	const auto n=__atomic_fetch_add(&tglFinishCount,1,__ATOMIC_RELAXED);
+	if (n<arrsize(tglFinishRecords)) {
+		auto q=tglFinishRecords[n];clock_get_uptime(&q[0]);q[1]=index;q[2]=done;q[3]=issued;
+	}
+	SYSLOG("igfx","completed stamp %d lost in a GPU reset: %u -> %u",index,done,issued);
+	return result;
+}
+
 void XE::wrapTGLRecovery(void *channel) {
 	const auto n=__atomic_fetch_add(&tglRecoveryCalls,1,__ATOMIC_RELAXED);
+	tglRecoveryTableSample(n,channel);
 	uint64_t before {};clock_get_uptime(&before);
+	auto owner=TGLRecovery::field<void *>(channel,0x18);
+	tglRecoveryForceWake(owner,true,7);
+	auto mmio=TGLRecovery::field<uint8_t *>(owner,0x1240);
+	TGLRecovery::save(mmio,tglRecoverySnapshot);
+	const bool diff=n==0;
+	if (diff) tglDiffRead(mmio,tglDiffBefore);
+	tglRecoveryForceWake(owner,false,7);
+	const auto rcuBefore=tglRecoverySnapshot.shared[0];
 	const auto result=TGLRecovery::resetAndResume(channel);
+	if (diff) {
+		tglRecoveryForceWake(owner,true,7);tglDiffRead(mmio,tglDiffAfter);tglRecoveryForceWake(owner,false,7);
+		__atomic_store_n(&tglDiffState,2,__ATOMIC_RELEASE);
+	}
 	uint64_t after {};clock_get_uptime(&after);
 	if (n<arrsize(tglRecoveryRecords)) {
 		auto q=tglRecoveryRecords[n];q[0]=123;q[1]=n+1;q[2]=before;q[3]=after;
 		q[4]=reinterpret_cast<uintptr_t>(channel);q[5]=result.ring;
 		q[6]=result.context;q[7]=result.affected;q[8]=result.index;
 		q[9]=result.failuresBefore;q[10]=result.failuresAfter;q[11]=result.resetOK;
+		q[12]=rcuBefore;q[13]=tglRecoverySnapshot.rcuAfterReset;q[14]=tglRecoverySnapshot.rcuRestored;
 		__atomic_store_n(&q[15],1,__ATOMIC_RELEASE);
 	}
 	__atomic_fetch_add(&tglRecoveryReturns,1,__ATOMIC_RELEASE);
+}
+
+// RCS and CCS share reset domain 2: restore the engine the native reset does not,
+// then replay both. The second call returns at once when that engine was idle.
+void XE::wrapTGLProcessGPUReset(void *scheduler, uint32_t engine, void *context) {
+	auto original=FunctionCast(wrapTGLProcessGPUReset,callbackXE->orgTGLProcessGPUReset);
+	if (engine>1 || !tglRecoverySnapshot.ready) return original(scheduler,engine,context);
+	auto owner=TGLRecovery::field<void *>(scheduler,0x10);
+	TGLRecovery::restoreSibling(TGLRecovery::field<uint8_t *>(owner,0x1240),engine,tglRecoverySnapshot);
+	original(scheduler,engine,context);
+	original(scheduler,1-engine,context);
 }
 
 extern "C" {
@@ -11548,19 +11662,50 @@ bool XE::processTGLAccelerator(KernelPatcher &patcher, size_t index, mach_vm_add
 					0x49,0x8B,0x76,0x20,0x48,0x8B,0x9E,0xB8,0,0,0};
 				const uint8_t failedAndResume[] {0xFF,0x83,0x7C,0x01,0,0,0x49,0x8B,0x47,0x18,0x48,0x8B,0xB8,0x50,0x12,0,0,
 					0x48,0x8B,0x07,0xFF,0x90,0x80,0x01,0,0};
+				const char *processReset="__ZN12IGScheduler515processGPUResetE10IGHwCsTypeP17IGHardwareContext";
+				const uint8_t processResetHead[] {0x55,0x48,0x89,0xE5,0x89,0xF0,0x48,0x8B,0xBC,0xC7,0xA0,0x0C,0,0,0x5D,0xE9};
+				const auto forceWake=patcher.solveSymbol<mach_vm_address_t>(index,"__ZN16IntelAccelerator13SafeForceWakeEbj",address,size);
 				recoveryOK=hostOK && size>0xDF668 &&
 					patcher.solveSymbol<mach_vm_address_t>(index,recovery,address,size)==address+0x4CA1E &&
 					patcher.solveSymbol<mach_vm_address_t>(index,"__ZN20IGHardwareRingBuffer19resetGraphicsEngineEP17IGHardwareContext",address,size)==address+0x43576 &&
 					patcher.solveSymbol<mach_vm_address_t>(index,"__ZN12IGScheduler56resumeEv",address,size)==address+0x3906C &&
+					patcher.solveSymbol<mach_vm_address_t>(index,processReset,address,size)==address+0x380D8 &&
+					forceWake==address+0x28C2A &&
 					!memcmp(reinterpret_cast<void *>(address+0x4CA1E),head,sizeof(head)) &&
-					!memcmp(reinterpret_cast<void *>(address+0x4CA5F),failedAndResume,sizeof(failedAndResume));
+					!memcmp(reinterpret_cast<void *>(address+0x4CA5F),failedAndResume,sizeof(failedAndResume)) &&
+					!memcmp(reinterpret_cast<void *>(address+0x380D8),processResetHead,sizeof(processResetHead));
 				patcher.clearError();
 				if (recoveryOK) {
-					KernelPatcher::RouteRequest hook[] {{recovery,wrapTGLRecovery,orgTGLRecovery}};
+					tglRecoveryForceWake=reinterpret_cast<void (*)(void *,bool,uint32_t)>(forceWake);
+					KernelPatcher::RouteRequest hook[] {{recovery,wrapTGLRecovery,orgTGLRecovery},
+						{processReset,wrapTGLProcessGPUReset,orgTGLProcessGPUReset}};
 					recoveryOK=patcher.routeMultiple(index,hook,arrsize(hook),address,size);
 				}
 				if (recoveryOK) if (auto live=OSSerializer::forTarget(nullptr,tglRecoverySerialize)) {
 					IORegistryEntry::getRegistryRoot()->setProperty("TGLRecoveryLive",live);live->release();
+				}
+				if (recoveryOK) if (auto live=OSSerializer::forTarget(nullptr,tglRecoveryTableSerialize)) {
+					IORegistryEntry::getRegistryRoot()->setProperty("TGLRecoveryTableLive",live);live->release();
+				}
+				if (recoveryOK) if (auto live=OSSerializer::forTarget(nullptr,tglDiffSerialize)) {
+					IORegistryEntry::getRegistryRoot()->setProperty("TGLResetDiffLive",live);live->release();
+				}
+				// eventTimeout's head is plain register setup, safe to route.
+				if (recoveryOK) {
+					const char *timeout="__ZN19IGAccelEventMachine12eventTimeoutEi";
+					const uint8_t timeoutHead[] {0x55,0x48,0x89,0xE5,0x41,0x57,0x41,0x56,0x41,0x55,0x41,0x54,0x53,0x48,0x83,0xEC,0x18,0x41,0x89,0xF5};
+					bool finishOK=patcher.solveSymbol<mach_vm_address_t>(index,timeout,address,size)==address+0x15F22 &&
+						!memcmp(reinterpret_cast<void *>(address+0x15F22),timeoutHead,sizeof(timeoutHead));
+					patcher.clearError();
+					if (finishOK) {
+						KernelPatcher::RouteRequest hook[] {{timeout,wrapTGLEventTimeout,orgTGLEventTimeout}};
+						finishOK=patcher.routeMultiple(index,hook,arrsize(hook),address,size);
+					}
+					patcher.clearError();
+					IORegistryEntry::getRegistryRoot()->setProperty("TGLLostStampFinishReady",finishOK);
+					if (finishOK) if (auto live=OSSerializer::forTarget(nullptr,tglFinishSerialize)) {
+						IORegistryEntry::getRegistryRoot()->setProperty("TGLLostStampFinishLive",live);live->release();
+					}
 				}
 			}
 			IORegistryEntry::getRegistryRoot()->setProperty("TGLRecoverySinglePassRequested",recoveryRequested);
@@ -14391,6 +14536,7 @@ bool tglCSBSerialize(void *,void *,OSSerialize *serializer) {
 }
 }
 
+namespace { bool tglResetSerialize(void *,void *,OSSerialize *); }
 bool XE::installTGLCSB12(KernelPatcher &patcher,size_t index,mach_vm_address_t address,size_t size) {
  KernelPatcher::RouteRequest routes[] {
   {"__ZN26IGHardwareCommandStreamer54initEP22IOGraphicsAccelerator2P10IOWorkLoopP12IGScheduler510IGHwCsType",wrapTGLCSBInit,orgTGLCSBInit},
@@ -14471,6 +14617,8 @@ bool XE::installTGLCSB12(KernelPatcher &patcher,size_t index,mach_vm_address_t a
   if (data) {root->setProperty("TGLCSB12Live",data);data->release();}
   auto modes=OSSerializer::forTarget(nullptr,tglCSBModeSerialize);
   if (modes) {root->setProperty("TGLCSBModeAtInit",modes);modes->release();}
+  auto resets=OSSerializer::forTarget(nullptr,tglResetSerialize);
+  if (resets) {root->setProperty("TGLResetLive",resets);resets->release();}
  }
  tglCSB12Enabled=ok;patcher.clearError();return ok;
 }
@@ -14491,9 +14639,45 @@ bool XE::wrapTGLCSBInit(void *streamer,void *owner,void *loop,void *scheduler,un
  return ok;
 }
 void XE::wrapTGLCSBWake(void *streamer) { tglCSBInitialize(streamer); }
+// EXPERIMENT: GPU reset evidence. Native processGPUReset runs inside
+// resetGraphicsEngine's render force-wake, after GDRST and the register
+// restore. Record RCS and CCS0 execlist state and both native banks before and
+// after it. Read only; no writes, waits or extra wakes.
+namespace {
+const uint32_t tglResetRegs[] {0x34,0x38,0x3C,0x80,0x98,0xA8,0x234,0x238,0x244,0x29C,0x3A0,0x510,0x514,0x550};
+const uint32_t tglResetBases[] {0x2000,0x1A000};
+struct TGLResetRecord { uint64_t q[96]; volatile uint32_t ready; };
+TGLResetRecord tglReset[16];
+uint32_t tglResetCount;
+void tglResetSample(uint64_t *q,uint8_t *streamer) {
+ auto owner=*reinterpret_cast<uint8_t **>(streamer+0x10);
+ auto bar=owner ? *reinterpret_cast<volatile uint8_t **>(owner+0x1240) : nullptr;
+ q[0]=*reinterpret_cast<uint32_t *>(streamer+0x50);
+ tglHostBanks(streamer,q+1);
+ for (unsigned b=0;bar && b<arrsize(tglResetBases);++b)
+  for (unsigned i=0;i<arrsize(tglResetRegs);++i)
+   q[13+b*arrsize(tglResetRegs)+i]=*reinterpret_cast<volatile uint32_t *>(bar+tglResetBases[b]+tglResetRegs[i]);
+}
+bool tglResetSerialize(void *,void *,OSSerialize *serializer) {
+ auto data=OSData::withCapacity(sizeof(tglReset)+8);if (!data) return false;
+ const uint64_t count=__atomic_load_n(&tglResetCount,__ATOMIC_ACQUIRE);
+ bool ok=data->appendBytes(&count,sizeof(count));
+ for (unsigned i=0;i<arrsize(tglReset) && ok;++i) {
+  uint64_t q[96] {};
+  if (__atomic_load_n(&tglReset[i].ready,__ATOMIC_ACQUIRE)) memcpy(q,tglReset[i].q,sizeof(q));
+  ok=data->appendBytes(q,sizeof(q));
+ }
+ if (ok) ok=data->serialize(serializer);data->release();return ok;
+}
+}
 void XE::wrapTGLCSBReset(void *streamer) {
+ const auto n=__atomic_fetch_add(&tglResetCount,1,__ATOMIC_RELAXED);
+ auto s=static_cast<uint8_t *>(streamer);
+ uint64_t *q=n<arrsize(tglReset) ? tglReset[n].q : nullptr;
+ if (q) {tglHostClock(q);q[1]=reinterpret_cast<uintptr_t>(streamer);q[2]=(*reinterpret_cast<uint8_t **>(s+0x28))[0];tglResetSample(q+4,s);}
  tglCSBInitialize(streamer);
  FunctionCast(wrapTGLCSBReset,callbackXE->orgTGLCSBReset)(streamer);
+ if (q) {tglResetSample(q+50,s);__atomic_store_n(&tglReset[n].ready,1,__ATOMIC_RELEASE);}
 }
 void XE::wrapTGLCSBProcess(void *streamer,uint32_t flags) {
  TGLCSBIO io(streamer,flags);auto &engine=tglCSBEngines[io.engine];

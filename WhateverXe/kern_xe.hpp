@@ -698,7 +698,10 @@ private:
 	static void wrapTGLSurfaceAux(void *resource, void *entry, uint32_t *surface, uint32_t intent);
 	mach_vm_address_t orgTGLHangRingDump {};
 	static void wrapTGLHangRingDump(void *ring, void *registers);
-	mach_vm_address_t orgTGLRecovery {};
+	mach_vm_address_t orgTGLRecovery {}, orgTGLEventTimeout {};
+	static uint64_t wrapTGLEventTimeout(void *machine, int index);
+	mach_vm_address_t orgTGLProcessGPUReset {};
+	static void wrapTGLProcessGPUReset(void *scheduler, uint32_t engine, void *context);
 	static void wrapTGLRecovery(void *channel);
 	static void wrapTGLFastCopy(void *context, void *params, const void *rects, void *workarounds);
 	mach_vm_address_t orgTGLHostSubmit {}, orgTGLHostWait {}, orgTGLHostCSB {}, orgTGLHostCSBPanic {}, orgTGLHostCSBIDPanic {};

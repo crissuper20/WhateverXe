@@ -7,7 +7,7 @@
 namespace {
 alignas(16) uint8_t channel[0x180],affected[0x180],ring[0x100],context[0xD0];
 alignas(16) uint8_t owner[0x1300],scheduler[0x200],otherScheduler[0x200];
-alignas(16) uint8_t ringVT[0x200],schedulerVT[0x200];
+alignas(16) uint8_t ringVT[0x200],schedulerVT[0x200],mmio[0x20000];
 unsigned resets,resumes,stage;bool nativeOK,replaceScheduler;
 bool reset(void *r,void *c) {
 	assert(r==ring && c==context && stage++==0);++resets;
@@ -44,5 +44,29 @@ int main() {
 		// Affected channel comes from the context; do not update caller blindly.
 		assert(TGLRecovery::field<uint32_t>(channel,0x17C)==0);
 	}
-	puts("12 recovery cases passed: native result, count, order, affected channel, owner reload");
+	for (uint32_t hung:{0U,1U}) {
+		memset(mmio,0,sizeof(mmio));
+		using namespace TGLRecovery;
+		for (const auto &r:rcsRegisters) field<uint32_t>(mmio,r.reg)=r.reg^0x55;
+		for (const auto &r:ccsRegisters) field<uint32_t>(mmio,r.reg)=r.reg^0x55;
+		for (const auto &r:sharedRegisters) field<uint32_t>(mmio,r.reg)=r.reg^0x55;
+		field<uint32_t>(mmio,rcuMode)=1;
+		Snapshot snapshot {};
+		save(mmio,snapshot);
+		assert(snapshot.ready && snapshot.shared[0]==1);
+		memset(mmio,0,sizeof(mmio)); // The reset clears both engines.
+		restoreSibling(mmio,hung,snapshot);
+		assert(!snapshot.ready && snapshot.rcuAfterReset==0);
+		assert(field<uint32_t>(mmio,rcuMode)==0xFFFF0001 && snapshot.rcuRestored==0xFFFF0001);
+		assert(field<uint32_t>(mmio,0x1A4D0)==(0x1A4D0^0x55));
+		assert(field<uint32_t>(mmio,0xB09C)==(0xB09C^0x55) && field<uint32_t>(mmio,0xE434)==(0xE434^0x55));
+		// The native reset owns the hung engine's list.
+		const auto &sibling=hung==0 ? ccsRegisters[0] : rcsRegisters[0];
+		const auto &own=hung==0 ? rcsRegisters[0] : ccsRegisters[0];
+		assert(field<uint32_t>(mmio,sibling.reg)==(sibling.reg^0x55));
+		assert(field<uint32_t>(mmio,own.reg)==0);
+		const auto &masked=hung==0 ? ccsRegisters[1] : rcsRegisters[2];
+		assert(field<uint32_t>(mmio,masked.reg)==((masked.reg^0x55)|0xFFFF0000U));
+	}
+	puts("14 recovery cases passed: native result, count, order, affected channel, owner reload, sibling restore");
 }
