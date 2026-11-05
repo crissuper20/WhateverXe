@@ -148,6 +148,25 @@ extern "C" __attribute__((naked,used)) void tglTahoeMatrixBridge() {
   "1: jmpq *_tglSonomaMatrixZero(%rip)\n"
   "2: jmpq *_tglSonomaMatrixOther(%rip)\n");
 }
+// EXPERIMENT: at submit IntelMTLRenderFunctions::execute ORs compression into a
+// Metal STENCIL_BUFFER (dw1 bits 24/25, 52daa) and maps it in the AUX table when the
+// resource can compress. A stencil-only WM_HZ_OP clear of that buffer hangs the
+// render engine. For STENCIL_BUFFER only, take the kext's own uncompressed branch
+// at 52de0, which resolves CCS first if the resource is dirty.
+extern "C" {
+uintptr_t tglStencilPlain, tglStencilCompress;
+}
+extern "C" __attribute__((naked,used)) void tglStencilCompressBridge() {
+ asm volatile(
+  "movq 0x10(%rbp), %rcx\n"
+  "cmpl $0, 0x44(%r12)\n"
+  "je 1f\n"
+  "movq -0xa0(%rbp), %rax\n"
+  "cmpl $0x78060006, (%r15,%rax,4)\n"
+  "je 1f\n"
+  "jmpq *_tglStencilCompress(%rip)\n"
+  "1: jmpq *_tglStencilPlain(%rip)\n");
+}
 static bool tglSonomaSurfaceFramebufferReady=true;
 static bool tglInstallSonomaSurfaceABI(KernelPatcher &patcher,size_t index,mach_vm_address_t address,size_t size,bool framebuffer) {
  if((XELP::kernelOS(version)!=XELP::OS::Sonoma) && (XELP::kernelOS(version)!=XELP::OS::Sequoia) && (XELP::kernelOS(version)!=XELP::OS::Tahoe))return true;
@@ -11389,6 +11408,25 @@ bool XE::processTGLAccelerator(KernelPatcher &patcher, size_t index, mach_vm_add
 			IORegistryEntry::getRegistryRoot()->setProperty("TGLRenderPassFlushReady",flushOK);
 			IORegistryEntry::getRegistryRoot()->setProperty("TGLRenderPassTileFlushReady",flushOK);
 			IORegistryEntry::getRegistryRoot()->setProperty("TGLRenderPassConstAlternativeReady",flushOK);
+			// EXPERIMENT: send STENCIL_BUFFER down the uncompressed branch (see bridge).
+			const uint8_t stencilCompress[] {0x41,0x83,0x7C,0x24,0x44,0x00,0x48,0x8B,0x4D,0x10,0x74,0x3D,
+				0x48,0x8B,0x85,0x60,0xFF,0xFF,0xFF,0x41,0x80,0x4C,0x87,0x07,0x03};
+			bool stencilOK=size>0x52DE6 &&
+				patcher.solveSymbol<mach_vm_address_t>(index,"__ZN23IntelMTLRenderFunctions7executeEN14IntelMTLRender7eTokensER19IGAccelCommandQueueR26IGAccelSegmentResourceListRK20IOAccelKernelCommandR24IGAccelCommandDescriptorR13IGHeapsAccessR22IOGraphicsAccelerator2R17IGHardwareContextR12IOAccelEvent",address,size)==address+0x4F1F0 &&
+				!memcmp(reinterpret_cast<void *>(address+0x52D97),stencilCompress,sizeof(stencilCompress));
+			patcher.clearError();
+			if (stencilOK) {
+				tglStencilPlain=address+0x52DE0;tglStencilCompress=address+0x52DAA;
+				uint8_t jump[19] {0xFF,0x25,0,0,0,0};
+				const auto target=reinterpret_cast<uintptr_t>(tglStencilCompressBridge);
+				memcpy(jump+6,&target,sizeof(target));memset(jump+14,0x90,5);
+				patcher.routeBlock(address+0x52D97,jump,sizeof(jump));
+				stencilOK=patcher.getError()==KernelPatcher::Error::NoError &&
+					!memcmp(reinterpret_cast<void *>(address+0x52D97),jump,sizeof(jump));
+				patcher.clearError();
+			}
+			IORegistryEntry::getRegistryRoot()->setProperty("TGLStencilCompressGateReady",stencilOK);
+			SYSLOG("igfx","TGL stencil compression gate ready=%d",stencilOK);
 			// The outer RCS completion emitter is separate from the render-pass
 			// emitter above. Apply the same Vol14 constant-cache alternative to
 			// its stamp and optional notification packets on the qualified Tahoe
