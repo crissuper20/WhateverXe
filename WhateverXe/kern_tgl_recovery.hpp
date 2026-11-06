@@ -28,7 +28,12 @@ constexpr uint32_t rcuMode=0x14800;
 // The reset also clears the L3 cache policy table (LNCFCMOCS 0xB020-0xB09C) and
 // 0xB104, 0xB170, 0xE434; seen on 25G332, and leaving them cost 4-15x speed.
 // 0xB170 bit 31 and 0xE434 are live state and do not keep the restored value.
+// EXPERIMENT: the reset also sets both engines' power-context idle count
+// (0x2054/0x1A054, 0xa to 0x40) and error mask (0x20B4/0x1A0B4, fffffffa to
+// ffffffff), which neither engine's native list restores. Idea credit:
+// retropineaple/WhateverXe (adlp-edp), which restores the RCS pair.
 constexpr Register sharedRegisters[] {{rcuMode,true},{0xCE90,true},{0x1A4D0,false},{0x1A0A8,false},{0x1A098,false},
+	{0x2054,false},{0x20B4,false},{0x1A054,false},{0x1A0B4,false},
 	{0xB020,false},{0xB024,false},{0xB028,false},{0xB02C,false},{0xB030,false},{0xB034,false},{0xB038,false},{0xB03C,false},
 	{0xB040,false},{0xB044,false},{0xB048,false},{0xB04C,false},{0xB050,false},{0xB054,false},{0xB058,false},{0xB05C,false},
 	{0xB060,false},{0xB064,false},{0xB068,false},{0xB06C,false},{0xB070,false},{0xB074,false},{0xB078,false},{0xB07C,false},

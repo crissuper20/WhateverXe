@@ -60,6 +60,8 @@ int main() {
 		assert(field<uint32_t>(mmio,rcuMode)==0xFFFF0001 && snapshot.rcuRestored==0xFFFF0001);
 		assert(field<uint32_t>(mmio,0x1A4D0)==(0x1A4D0^0x55));
 		assert(field<uint32_t>(mmio,0xB09C)==(0xB09C^0x55) && field<uint32_t>(mmio,0xE434)==(0xE434^0x55));
+		// Both engines' idle count and error mask come back whichever engine hung.
+		for (uint32_t reg:{0x2054U,0x20B4U,0x1A054U,0x1A0B4U}) assert(field<uint32_t>(mmio,reg)==(reg^0x55));
 		// The native reset owns the hung engine's list.
 		const auto &sibling=hung==0 ? ccsRegisters[0] : rcsRegisters[0];
 		const auto &own=hung==0 ? rcsRegisters[0] : ccsRegisters[0];
