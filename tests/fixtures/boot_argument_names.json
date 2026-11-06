@@ -140,5 +140,6 @@
   "-wex-adlp-load-only": [],
   "-wex-display13-offline": [],
   "-wexedpoff": [],
-  "-wexhangcap": []
+  "-wexhangcap": [],
+  "-wex-tgl-gen12-dither": []
 }

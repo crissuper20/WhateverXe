@@ -107,6 +107,36 @@ int main(int argc,char **argv) {
   }
   puts("PASS: installed video driver satisfies both pixel-transfer sites");
  }
+ // Gen12 dither kernel: two parts of one slot, each gated by the hash of its original bytes.
+ static_assert(sizeof(gen12Dither420v)==0xbb0,"slot size");
+ assert(ditherParts[0].page+ditherParts[0].offset+ditherParts[0].size==ditherParts[1].page+ditherParts[1].offset);
+ assert(ditherParts[0].page+ditherParts[0].offset==0x761f00 && ditherParts[1].source==ditherParts[0].size);
+ assert(ditherParts[1].source+ditherParts[1].size==sizeof(gen12Dither420v));
+ for(size_t i=2960;i<sizeof(gen12Dither420v);++i) assert(!gen12Dither420v[i]);
+ {const uint8_t abc[]={'a','b','c'}; assert(fnv1a(abc,3)==0xe71fa2190541574bULL);} // Published FNV-1a 64 vector.
+ if(argc>3) {
+  for(auto &part:ditherParts) {
+   FILE *f=fopen(argv[3],"rb"); assert(f); assert(!fseek(f,part.page,SEEK_SET)); assert(fread(page,1,sizeof(page),f)==sizeof(page)); fclose(f);
+   // With -wexgen12dither a read returns the patched page from the unified buffer cache.
+   if(!memcmp(page+part.offset,gen12Dither420v+part.source,part.size)) continue;
+   assert(ditherPart(page,part.page,true,false,"25G332")==&part);
+   assert(!ditherPart(page,part.page+0x1000,true,false,"25G332"));
+   assert(!ditherPart(page,part.page,true,false,"25G241"));
+   assert(!ditherPart(page,part.page,false,false,"25G332"));
+   assert(!ditherPart(page,part.page,true,true,"25G332"));
+   for(size_t i=0;i<part.size;i+=37) {
+    uint8_t copy[sizeof(page)]; memcpy(copy,page,sizeof(page)); copy[part.offset+i]^=1;
+    assert(!ditherPart(copy,part.page,true,false,"25G332"));
+   }
+   uint8_t before[sizeof(page)]; memcpy(before,page,sizeof(page));
+   applyDither(page,part);
+   assert(!memcmp(page+part.offset,gen12Dither420v+part.source,part.size));
+   assert(!memcmp(page,before,part.offset));                                   // Nothing before the slot moves.
+   assert(!memcmp(page+part.offset+part.size,before+part.offset+part.size,sizeof(page)-part.offset-part.size));
+   assert(!ditherPart(page,part.page,true,false,"25G332"));                    // One pass only.
+  }
+  puts("PASS: installed video driver holds the original kernel 3 slot");
+ }
  // Metal driver sites: each page is admitted only with all of its own sites, the others are ignored.
  const uint64_t metalPages[]={0x26000,0x7e000};
  for(uint64_t metalPage:metalPages) {

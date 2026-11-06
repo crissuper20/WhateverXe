@@ -10,6 +10,7 @@ using Validate=void (*)(void *,void *,uint64_t,const void *,int *,int *,int *);
 Validate originalValidate;
 int (*getPath)(void *,char *,int *);
 const char *runningBuild;
+bool gen12Dither; // EXPERIMENT: -wex-tgl-gen12-dither
 
 // Keeps the path buffer off the stack of every other page validation.
 __attribute__((noinline)) bool pathMatches(void *vnode,bool (*match)(const char *)) {
@@ -29,14 +30,17 @@ void validatePage(void *vnode,void *pager,uint64_t offset,const void *data,int *
  auto site=!bridge && !video ? TahoeDescriptor::driverSite(data,offset,checked,dirty,runningBuild) : nullptr;
  if(site && !pathMatches(vnode,TahoeDescriptor::driverImage))site=nullptr;
  const bool metal=!bridge && !video && !site && TahoeDescriptor::metalAdmitted(data,offset,checked,dirty,runningBuild) && pathMatches(vnode,TahoeDescriptor::metalImage);
- if((!bridge && !video && !site && !metal) || MachInfo::setKernelWriting(true,KernelPatcher::kernelWriteLock)!=KERN_SUCCESS)return;
+ auto dither=gen12Dither && !bridge && !video && !site && !metal ? TahoeDescriptor::ditherPart(data,offset,checked,dirty,runningBuild) : nullptr;
+ if(dither && !pathMatches(vnode,TahoeDescriptor::driverImage))dither=nullptr;
+ if((!bridge && !video && !site && !metal && !dither) || MachInfo::setKernelWriting(true,KernelPatcher::kernelWriteLock)!=KERN_SUCCESS)return;
  auto page=static_cast<uint8_t *>(const_cast<void *>(data));
  if(bridge)TahoeDescriptor::apply(page);
  else if(video)TahoeDescriptor::applyVideo(page);
  else if(metal)TahoeDescriptor::applyMetal(page,offset);
+ else if(dither)TahoeDescriptor::applyDither(page,*dither);
  else TahoeDescriptor::applyDriver(page,*site);
  MachInfo::setKernelWriting(false,KernelPatcher::kernelWriteLock);
- SYSLOG("wex","Tahoe %s admitted for %s page %llx",bridge ? "descriptor bridge" : video ? "video adapter" : metal ? "Metal driver" : "pixel transfer",runningBuild,offset);
+ SYSLOG("wex","Tahoe %s admitted for %s page %llx",bridge ? "descriptor bridge" : video ? "video adapter" : metal ? "Metal driver" : dither ? "Gen12 dither kernel" : "pixel transfer",runningBuild,offset);
 }
 }
 
@@ -53,6 +57,9 @@ void TahoeDescriptor::processKernel(KernelPatcher &p) {
   p.clearError();
  }
  IORegistryEntry::getRegistryRoot()->setProperty("WhateverXeTahoeDescriptor",ready);
+ gen12Dither=ready && checkKernelArgument("-wex-tgl-gen12-dither");
+ IORegistryEntry::getRegistryRoot()->setProperty("WhateverXeGen12Dither",gen12Dither);
+ SYSLOG("wex","Gen12 AVD dither kernel %s",gen12Dither ? "enabled" : "off");
  if(ready)IORegistryEntry::getRegistryRoot()->setProperty("WhateverXeVideoTransfer","software");
  SYSLOG("wex","Tahoe descriptor hook ready=%d",ready);
  if(ready)SYSLOG("wex","video pixel transfer has no hardware path: software conversion in use");

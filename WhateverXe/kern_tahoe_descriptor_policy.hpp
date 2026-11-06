@@ -3,6 +3,7 @@
 #include <stddef.h>
 #include <stdint.h>
 #include <string.h>
+#include "kern_gen12_dither.hpp"
 
 // impostor.dylib bridges Metal's Tahoe descriptors to the older driver layout,
 // but only after comparing kern.osversion with 25G241. Without the bridge the
@@ -82,6 +83,29 @@ inline const DriverSite *driverSite(const void *page,uint64_t offset,bool valida
  return nullptr;
 }
 inline void applyDriver(uint8_t *page,const DriverSite &site) {memcpy(page+site.offset,site.after,site.size);}
+
+// EXPERIMENT (-wex-tgl-gen12-dither): AVD_VideoProcessingContext kernel 3 dithers luma for
+// 420v output. It is Gen11 code, which Gen12 misreads, so its threads never end and
+// the render engine hangs. Replace it in place with our own Gen12 kernel. The slot is
+// 2992 bytes at 0x761f00 in __data and spans two pages; each part is admitted only
+// when its original bytes have the expected FNV-1a hash.
+struct BlobPart {uint64_t page; size_t offset; size_t size; size_t source; uint64_t hash;};
+constexpr BlobPart ditherParts[] {
+ {0x761000,0xf00,0x100,0,0xbcfd7ab2e131478cULL},
+ {0x762000,0,0xab0,0x100,0x98b170911f579f73ULL},
+};
+inline uint64_t fnv1a(const uint8_t *bytes,size_t size) {
+ uint64_t hash=0xcbf29ce484222325ULL;
+ for(size_t i=0;i<size;++i) {hash^=bytes[i];hash*=0x100000001b3ULL;}
+ return hash;
+}
+inline const BlobPart *ditherPart(const void *page,uint64_t offset,bool validated,bool tainted,const char *build) {
+ if(!page || !validated || tainted || !build || strcmp(build,supportedBuild))return nullptr;
+ for(const auto &part:ditherParts)
+  if(part.page==offset && fnv1a(static_cast<const uint8_t *>(page)+part.offset,part.size)==part.hash)return &part;
+ return nullptr;
+}
+inline void applyDither(uint8_t *page,const BlobPart &part) {memcpy(page+part.offset,gen12Dither420v+part.source,part.size);}
 
 // Creating a counter sample buffer crashes in MTLIGCounterSampleBuffer::Init,
 // and the method's error path writes through a caller's null error pointer.
