@@ -118,6 +118,22 @@ enum {
 	HcpVp9SegmentState = 0x108 / 8,
 	MiFlushDw = 0x48 / 8,      // MI vtable slot
 	VdencPipelineFlush = 0x40 / 8, // VDENC vtable slot
+	HcpGetVp9BufferSize = 0x58 / 8,
+	HcpDecodeSurfaceState = 0x80 / 8,
+	HcpPipeBufAddr = 0x90 / 8,
+	HcpIndObjBaseAddr = 0x98 / 8,
+	PbaParamsVtable = 0x758558, // MHW_VDBOX_PIPE_BUF_ADDR_PARAMS_G12 (dynamic_cast too)
+	HevcBindSurface = 0x22b940, // (hevc, IOSurfaceRef, MOS_SURFACE *): fills the resource part
+	AllocateBuffer = 0x8a840,  // CodechalDecode::AllocateBuffer(codechal, res, size, name, 0, 0)
+	BitstreamId = 0x228df0,    // (context + 0x80, 0): id of the context's bitstream buffer
+	CodechalOs = 0x10,         // PMOS_INTERFACE
+	OsFreeResource = 0x200,    // MOS_INTERFACE function fields (plain members, no vtable)
+	OsGetResourceInfo = 0x210,
+	HcpAddResource = 0x2a8,    // MHW interface field: AddResourceToCmd(os, cmd, params)
+	SurfaceInfoPatch = 0x1d,   // MHW_RESOURCE_PARAMS command type of Apple's surface patches
+	FormatNV12 = 0x19,         // MOS_FORMAT as the HEVC decoder and SURFACE_STATE use it
+	ResourceSize = 0x148,      // MOS_RESOURCE; MOS_SURFACE adds the details up to 0x208
+	SurfaceSize = 0x208,
 	ModeVp9Vld = 12,           // CODECHAL_DECODE_MODE_VP9VLD
 	RefListSize = 0x1300,      // CODEC_REF_LIST is read at +0x1248/+0x124c (width, height)
 };
@@ -234,11 +250,167 @@ struct Previous {
 	uint32_t width, height;
 };
 
+// Internal buffers, allocated through the hidden decoder for one frame size: name, the
+// GetVp9BufferSize type (-1 = probability buffer, 0x1000 bytes as iHD) and the
+// PIPE_BUF_ADDR params field that points at it.
+static const struct {
+	const char *name;
+	int type;
+	uint32_t field;
+} buffers[] = {
+	{"WEXVP9DeblockLine", 0, 0xf0}, {"WEXVP9DeblockTileLine", 1, 0x2f0}, {"WEXVP9DeblockTileColumn", 2, 0x2f8},
+	{"WEXVP9MetadataLine", 4, 0x300}, {"WEXVP9MetadataTileLine", 5, 0x308}, {"WEXVP9MetadataTileColumn", 6, 0x310},
+	{"WEXVP9CurrentMvTemporal", 13, 0x330}, {"WEXVP9Probability", -1, 0x3c8}, {"WEXVP9SegmentId", 20, 0x3d0},
+	{"WEXVP9HvdLine", 21, 0x3d8}, {"WEXVP9HvdTile", 22, 0x3e0},
+};
+enum { BufferCount = sizeof(buffers) / sizeof(buffers[0]), MvTemporal = 6 };
+
+struct Hidden {
+	void *hevc;
+	void *context;
+	uint32_t frame;
+	struct Previous prev;
+	uint32_t bufferWidth, bufferHeight; // frame size the buffers were allocated for
+	uint8_t allocated[BufferCount];
+	uint8_t resource[BufferCount][ResourceSize];
+};
+
+static void *osInterface(void *hevc) {
+	void *codechal = *(void **)((uint8_t *)hevc + HevcCodechal);
+	return *(void **)((uint8_t *)codechal + CodechalOs);
+}
+
+// MOS_INTERFACE keeps its functions as plain fields, unlike the C++ objects' vtables.
+static void *field(const void *object, uint32_t offset) {
+	return *(void *const *)((const uint8_t *)object + offset);
+}
+
+static void freeBuffers(struct Hidden *hidden) {
+	void *os = osInterface(hidden->hevc);
+	Call2 freeResource = (Call2)field(os, OsFreeResource);
+	for (int i = 0; i < BufferCount; ++i)
+		if (hidden->allocated[i] && freeResource) freeResource(os, hidden->resource[i]);
+	memset(hidden->allocated, 0, sizeof(hidden->allocated));
+	memset(hidden->resource, 0, sizeof(hidden->resource));
+	hidden->bufferWidth = hidden->bufferHeight = 0;
+}
+
+// Allocates the internal buffers for this frame size (once per size) with Apple's own
+// size helper and allocator. Returns 0 when one fails.
+static int allocateBuffers(struct Hidden *hidden, uint32_t width, uint32_t height) {
+	if (hidden->bufferWidth == width && hidden->bufferHeight == height) return 1;
+	freeBuffers(hidden);
+	void *codechal = *(void **)((uint8_t *)hidden->hevc + HevcCodechal);
+	void *hcp = *(void **)((uint8_t *)codechal + CodechalHcp);
+	int ok = 1;
+	for (int i = 0; i < BufferCount; ++i) {
+		// MHW_VDBOX_HCP_BUFFER_SIZE_PARAMS: +0 max bit depth, +1 chroma format, +8/+0xc
+		// width/height in 64-pixel superblocks, +0x10 size out.
+		uint8_t sizeParams[0x20] = {0};
+		sizeParams[0] = 8;
+		sizeParams[1] = 1;
+		uint32_t sbWidth = (width + 63) / 64, sbHeight = (height + 63) / 64, size = 0x1000;
+		memcpy(sizeParams + 0x8, &sbWidth, 4);
+		memcpy(sizeParams + 0xc, &sbHeight, 4);
+		int status = 0;
+		if (buffers[i].type >= 0) {
+			status = ((int (*)(void *, int, void *))slot(hcp, HcpGetVp9BufferSize))(hcp, buffers[i].type, sizeParams);
+			memcpy(&size, sizeParams + 0x10, 4);
+		}
+		int alloc = status ? -1 : ((int (*)(void *, void *, uint32_t, const char *, int, int))(vaBase + AllocateBuffer))(
+			codechal, hidden->resource[i], size, buffers[i].name, 0, 0);
+		os_log(wexLog(), "WEXVP9 batch: buffer %{public}s type %d size 0x%x size status %d alloc status %d", buffers[i].name,
+			buffers[i].type, size, status, alloc);
+		if (status || alloc) ok = 0;
+		else hidden->allocated[i] = 1;
+	}
+	hidden->bufferWidth = width;
+	hidden->bufferHeight = height;
+	return ok;
+}
+
+// MOS_SURFACE for an IOSurface, as the HEVC decoder builds its output: the resource
+// part from HevcBindSurface plus Format_NV12 at +0x18, the details from the OS layer's
+// GetResourceInfo. That only copies width (also as pitch), height, format and tiling,
+// so the pitch and the chroma row offset come from the IOSurface planes. Also binds the
+// surface to the accelerator like HEVC does.
+static int surfaceFor(void *hevc, void *ioSurface, uint8_t *surface, const char *what) {
+	memset(surface, 0, SurfaceSize);
+	if (!ioSurface) return -1;
+	int bound = ((int (*)(void *, void *, void *))(vaBase + HevcBindSurface))(hevc, ioSurface, surface);
+	static int (*bindAccel)(void *, uint32_t);
+	if (!bindAccel) bindAccel = (int (*)(void *, uint32_t))dlsym(RTLD_DEFAULT, "IOSurfaceBindAccel");
+	int accel = bindAccel ? bindAccel(ioSurface, *(const uint32_t *)((const uint8_t *)hevc + 0x2c8)) : -1;
+	*(uint32_t *)(surface + 0x18) = FormatNV12;
+	uint8_t details[SurfaceSize] = {0};
+	*(int32_t *)(details + 0x188) = -14; // Format_Invalid
+	void *os = osInterface(hevc);
+	Call3 getInfo = (Call3)field(os, OsGetResourceInfo);
+	if (!getInfo) {
+		os_log(wexLog(), "WEXVP9 batch: surface %{public}s: OS GetResourceInfo is NULL, surface skipped", what);
+		return -1;
+	}
+	int info = getInfo(os, surface, details);
+	memcpy(surface + ResourceSize, details + ResourceSize, SurfaceSize - ResourceSize);
+	static size_t (*rowBytes)(void *, size_t);
+	static void *(*planeBase)(void *, size_t);
+	if (!rowBytes) rowBytes = (size_t (*)(void *, size_t))dlsym(RTLD_DEFAULT, "IOSurfaceGetBytesPerRowOfPlane");
+	if (!planeBase) planeBase = (void *(*)(void *, size_t))dlsym(RTLD_DEFAULT, "IOSurfaceGetBaseAddressOfPlane");
+	uint32_t infoPitch, format;
+	memcpy(&infoPitch, surface + 0x178, 4);
+	memcpy(&format, surface + 0x188, 4);
+	size_t pitch = rowBytes ? rowBytes(ioSurface, 0) : 0;
+	uintptr_t luma = planeBase ? (uintptr_t)planeBase(ioSurface, 0) : 0, chroma = planeBase ? (uintptr_t)planeBase(ioSurface, 1) : 0;
+	uint32_t uOffset = pitch && chroma > luma ? (uint32_t)((chroma - luma) / pitch) : 0;
+	if (pitch) *(uint32_t *)(surface + 0x178) = (uint32_t)pitch;
+	*(uint32_t *)(surface + 0x1b0) = uOffset;
+	os_log(wexLog(), "WEXVP9 batch: surface %{public}s %p bind %d accel %d info %d format %d pitch %u (info %u) "
+		"chroma at +0x%llx u-offset %u", what, ioSurface, bound, accel, info, (int)format, (uint32_t)pitch, infoPitch,
+		(unsigned long long)(chroma - luma), uOffset);
+	return bound || info || !pitch || !uOffset;
+}
+
+// Stand-in for HCP's AddResourceToCmd while the batch is only logged. Apple's version
+// registers the resource in the accelerator's command stream, which only a real command
+// buffer has. This writes a numbered placeholder address (0xadd00000 + n << 12, high
+// dword 0xadd) into the command instead, keeping the bits below the address alignment as
+// Apple's version does, and the upper bound the same way.
+// MHW_RESOURCE_PARAMS: +0x10 command dword, +0x1c alignment bits, +0x24 upper bound
+// dword offset, +0x28 size, +0x2c command type. Type 0x1d is Apple's surface-info patch
+// (SURFACE_STATE pitch and chroma offset dwords, filled by the kernel at submit); the
+// builder writes those fields itself afterwards, so it is only counted.
+static uint32_t placeholders, surfacePatches;
+
+static void placeAddress(uint32_t *at, uint32_t shift, uint32_t low) {
+	uint32_t mask = shift < 32 ? ~0u << shift : 0;
+	at[0] = (at[0] & ~mask) | (low & mask);
+	at[1] = 0xadd;
+}
+
+static int placeholderAddress(void *os, void *cmd, uint8_t *params) {
+	(void)os;
+	(void)cmd;
+	if (*(uint32_t *)(params + 0x2c) == SurfaceInfoPatch) {
+		++surfacePatches;
+		return 0;
+	}
+	uint32_t *at;
+	memcpy(&at, params + 0x10, 8);
+	uint32_t shift = *(uint32_t *)(params + 0x1c), upper = *(uint32_t *)(params + 0x24);
+	uint32_t low = 0xadd00000u + (++placeholders << 12);
+	placeAddress(at, shift, low);
+	if (upper) placeAddress(at + upper, shift, low + *(uint32_t *)(params + 0x28));
+	return 0;
+}
+
 // Builds one frame's commands from AppleGVA's request (layout in logRequest) and logs
 // them. Assumes default loop-filter deltas (ref 1/0/-1/-1, mode 0/0), no segmentation
 // data and reference frames of the current size: the request fields for those are not
 // mapped yet, so each frame logs that.
-static void buildBatch(void *hevc, const uint8_t *req, struct Previous *prev, uint32_t frame) {
+static void buildBatch(struct Hidden *hidden, const uint8_t *req) {
+	void *hevc = hidden->hevc;
+	struct Previous *prev = &hidden->prev;
+	uint32_t frame = hidden->frame++;
 	void *codechal = *(void **)((uint8_t *)hevc + HevcCodechal);
 	void *hcp = *(void **)((uint8_t *)codechal + CodechalHcp);
 	void *vdenc = *(void **)((uint8_t *)codechal + CodechalVdenc);
@@ -327,21 +499,83 @@ static void buildBatch(void *hevc, const uint8_t *req, struct Previous *prev, ui
 	uint32_t pipeFlush = 0x31;                  // HEVC wait done, VD parser done, HEVC flush
 	uint8_t flushDw[0x40] = {0};                // MHW_MI_FLUSH_DW_PARAMS
 
+	// Output and reference surfaces (AppleGVA's IOSurfaces at +0x1250 of the request and
+	// of each reference record), internal buffers and the context's bitstream buffer.
+	int inter = !key && !intra;
+	static uint8_t surfaces[4][SurfaceSize]; // current, LAST, GOLDEN, ALTREF
+	int sv[4] = {0, 0, 0, 0};
+	void *ioSurface;
+	memcpy(&ioSurface, req + 0x1250, 8);
+	sv[0] = surfaceFor(hevc, ioSurface, surfaces[0], "output");
+	for (int r = 0; inter && r < 3; ++r) {
+		memcpy(&ioSurface, req + 0x1260 + slots[r] * 0x1258 + 0x1250, 8);
+		sv[1 + r] = surfaceFor(hevc, ioSurface, surfaces[1 + r], r == 0 ? "last" : r == 1 ? "golden" : "altref");
+	}
+	int buffersOk = allocateBuffers(hidden, width, height);
+	uint8_t *context = hidden->context;
+	uint32_t streamSize;
+	memcpy(&streamSize, context + 0x88, 4);
+	uint8_t stream[ResourceSize] = {0}; // MOS_RESOURCE built as the HEVC decoder does
+	*(uint32_t *)(stream + 0x10) = streamSize;
+	*(uint32_t *)(stream + 0x18) = 0x3e; // Format_Buffer
+	*(uint32_t *)(stream + 0x1c) = 4;
+	*(uint32_t *)(stream + 0x38) = ((uint32_t (*)(void *, int))(vaBase + BitstreamId))(context + 0x80, 0);
+	memcpy(stream + 0x50, context + 0x90, 8);
+	os_log(wexLog(), "WEXVP9 batch frame=%u bitstream context size %u request bytes %u id %u buffers %d", frame, streamSize,
+		bytes, *(uint32_t *)(stream + 0x38), buffersOk);
+
+	// MHW_VDBOX_SURFACE_PARAMS: +0 mode, +8 surface, +0x11 chroma type (1 = 4:2:0), +0x12
+	// surface id (0 decoded, 2 LAST, 3 GOLDEN, 4 ALTREF).
+	uint8_t surfaceParams[4][0x40] = {{0}};
+	static const uint8_t surfaceIds[4] = {0, 2, 3, 4};
+	for (int i = 0; i < 4; ++i) {
+		*(uint32_t *)surfaceParams[i] = ModeVp9Vld;
+		*(void **)(surfaceParams[i] + 0x8) = surfaces[i];
+		surfaceParams[i][0x11] = 1;
+		surfaceParams[i][0x12] = surfaceIds[i];
+	}
+	// MHW_VDBOX_PIPE_BUF_ADDR_PARAMS_G12: vtable, +8 mode, +0x10 decoded surface, +0x68
+	// eight references (key frame: all the current surface; inter: LAST, GOLDEN, ALTREF,
+	// then the current surface, as iHD), internal buffers.
+	static uint64_t pba[0x100];
+	memset(pba, 0, sizeof(pba));
+	pba[0] = vaBase + PbaParamsVtable;
+	*(uint32_t *)((uint8_t *)pba + 0x8) = ModeVp9Vld;
+	*(void **)((uint8_t *)pba + 0x10) = surfaces[0];
+	for (int i = 0; i < 8; ++i) *(void **)((uint8_t *)pba + 0x68 + 8 * i) = inter && i < 3 ? surfaces[1 + i] : surfaces[0];
+	for (int i = 0; i < BufferCount; ++i)
+		if (hidden->allocated[i] && (i != MvTemporal || inter))
+			*(void **)((uint8_t *)pba + buffers[i].field) = hidden->resource[i];
+	// MHW_VDBOX_IND_OBJ_BASE_ADDR_PARAMS: +0 mode, +8 bitstream, +0x10 size, +0x14 offset.
+	uint8_t ind[0x80] = {0};
+	*(uint32_t *)ind = ModeVp9Vld;
+	*(void **)(ind + 0x8) = stream;
+	*(uint32_t *)(ind + 0x10) = bytes;
+
 	static struct CommandBuffer cmd;
 	initCommandBuffer(&cmd);
-	int s[8];
+	void **addResource = (void **)((uint8_t *)hcp + HcpAddResource);
+	void *appleAddResource = *addResource;
+	*addResource = (void *)placeholderAddress;
+	placeholders = surfacePatches = 0;
+	int s[8], r[6] = {0, 0, 0, 0, 0, 0};
 	s[0] = ((Call3)(vaBase + VdControlState))(mi, &cmd, vdInit);
 	s[1] = ((Call3)slot(hcp, HcpPipeModeSelect))(hcp, &cmd, pms);
+	for (int i = 0; i < (inter ? 4 : 1); ++i)
+		r[i] = sv[i] ? -1 : ((Call3)slot(hcp, HcpDecodeSurfaceState))(hcp, &cmd, surfaceParams[i]);
+	r[4] = sv[0] || !buffersOk ? -1 : ((Call3)slot(hcp, HcpPipeBufAddr))(hcp, &cmd, pba);
+	r[5] = streamSize < bytes ? -1 : ((Call3)slot(hcp, HcpIndObjBaseAddr))(hcp, &cmd, ind);
 	s[2] = ((Call4)slot(hcp, HcpVp9SegmentState))(hcp, &cmd, 0, segState);
 	s[3] = ((Call4)slot(hcp, HcpVp9PicState))(hcp, &cmd, 0, picState);
 	s[4] = ((Call3)slot(hcp, HcpBsdObject))(hcp, &cmd, bsd);
 	s[5] = ((Call3)(vaBase + VdControlState))(mi, &cmd, vdFlush);
 	s[6] = ((Call3)slot(vdenc, VdencPipelineFlush))(vdenc, &cmd, &pipeFlush);
 	s[7] = ((Call3)slot(mi, MiFlushDw))(mi, &cmd, flushDw);
+	*addResource = appleAddResource;
 	uint32_t n = usedDwords(&cmd);
-	os_log(wexLog(), "WEXVP9 batch frame=%u key=%d size=%ux%u q=%d lf=%d status=%d/%d/%d/%d/%d/%d/%d/%d dwords=%u "
-		"(default lf deltas, no segment data, refs at current size)", frame, key, width, height, q, level, s[0], s[1],
-		s[2], s[3], s[4], s[5], s[6], s[7], n);
+	os_log(wexLog(), "WEXVP9 batch frame=%u key=%d size=%ux%u q=%d lf=%d status=%d/%d/%d/%d/%d/%d/%d/%d "
+		"surface/addr/ind=%d/%d/%d/%d/%d/%d addresses %u surface patches %u dwords=%u (default lf deltas, no segment data, refs at current size)", frame,
+		key, width, height, q, level, s[0], s[1], s[2], s[3], s[4], s[5], s[6], s[7], r[0], r[1], r[2], r[3], r[4], r[5], placeholders, surfacePatches, n);
 	for (uint32_t at = 0; at < n; at += 16) {
 		char text[16 * 9 + 1];
 		uint32_t count = n - at < 16 ? n - at : 16;
@@ -356,26 +590,23 @@ static void buildBatch(void *hevc, const uint8_t *req, struct Previous *prev, ui
 
 // Same layout as the driver's root decoder base (ctor 0x21756): three pointers, 32
 // calloc'ed 8-byte cells at +0x20, a u32 at +0x120. The rest stays zero; ours keeps the
-// hidden HEVC decoder and per-session batch state there.
-struct Hidden {
-	void *hevc;
-	uint32_t frame;
-	struct Previous prev;
-};
+// hidden HEVC decoder and per-session batch state there (struct Hidden).
 
 struct Decoder {
 	const void *const *vtable;
 	uint64_t base[3];
 	void *cells[32];
 	uint32_t count;
-	uint8_t pad[4];
-	struct Hidden hidden;
-	uint8_t rest[0x400 - 0x128 - sizeof(struct Hidden)];
+	uint8_t rest[0x400 - 0x124]; // zero, as the driver's base
+	struct Hidden hidden;         // ours, past the base layout
 };
 
 static void destroy(struct Decoder *self) {
 	record(0, (uint64_t)self, 0, 0, 0, 0, 0);
-	if (self->hidden.hevc) ((void (*)(void *))slot(self->hidden.hevc, 1))(self->hidden.hevc);
+	if (self->hidden.hevc) {
+		freeBuffers(&self->hidden);
+		((void (*)(void *))slot(self->hidden.hevc, 1))(self->hidden.hevc);
+	}
 	self->hidden.hevc = 0;
 	for (int i = 0; i < 32; ++i) free(self->cells[i]);
 	memset(self->cells, 0, sizeof(self->cells));
@@ -405,7 +636,7 @@ static int slot5(uint64_t self, uint64_t a, uint64_t b, uint64_t c, uint64_t d, 
 	record(5, self, a, b, c, d, e);
 	struct Decoder *decoder = (struct Decoder *)self;
 	if (logRequest(a) && decoder->hidden.hevc)
-		buildBatch(decoder->hidden.hevc, request, &decoder->hidden.prev, decoder->hidden.frame++);
+		buildBatch(&decoder->hidden, request);
 	return 0;
 }
 
@@ -456,6 +687,9 @@ __attribute__((visibility("default"))) void *WEXVP9Create(void *context, void *c
 		return 0;
 	}
 	// A missing hidden decoder only turns the batch log off; the capture decoder stays.
-	if (markerExists("WEXVP9.batch")) self->hidden.hevc = createHevc(context, node);
+	if (markerExists("WEXVP9.batch")) {
+		self->hidden.hevc = createHevc(context, node);
+		self->hidden.context = context;
+	}
 	return self;
 }
