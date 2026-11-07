@@ -34,6 +34,7 @@
 #include "kern_display13_fb_sysmem.hpp"
 #include "kern_display13_fb_topology.hpp"
 #include "kern_tgl_fb_binding.hpp"
+#include "kern_tahoe_descriptor.hpp"
 #include "kern_display13_fb_irq.hpp"
 #include "kern_display13_cursor.hpp"
 #include "kern_display13_dbuf.hpp"
@@ -13803,6 +13804,11 @@ bool XE::wrapTGLAcceleratorStart(IOService *that, IOService *provider) {
 	if (!that->getProperty("IOGVAHEVCDecode") &&
 	    OSDynamicCast(OSDictionary, that->getProperty("IOGVAHEVCDecodeCapabilities")))
 		that->setProperty("IOGVAHEVCDecode", "2");
+	// EXPERIMENT (-wex-tgl-vp9): AppleGVA loads its VP9 front end only when the
+	// accelerator publishes this key (ICL/KBL: "2"). Publish it only together with
+	// the VA factory route to WEXVP9.dylib; never on its own.
+	if (TahoeDescriptor::vp9Requested() && !that->getProperty("IOGVAXDecode"))
+		that->setProperty("IOGVAXDecode", "2");
 
 	if (!tglBlitScratchSize || (*tglBlitScratchSize!=0xD240 && *tglBlitScratchSize!=0xE000)) {
 		SYSLOG("igfx", "TGL blit scratch parameter mismatch");

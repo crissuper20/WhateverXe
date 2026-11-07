@@ -3,4 +3,6 @@
 #include <Headers/kern_patcher.hpp>
 namespace TahoeDescriptor {
 void processKernel(KernelPatcher &patcher);
+// EXPERIMENT (-wex-tgl-vp9): flag set and the page hook ready.
+bool vp9Requested();
 }

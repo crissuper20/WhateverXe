@@ -107,6 +107,73 @@ inline const BlobPart *ditherPart(const void *page,uint64_t offset,bool validate
 }
 inline void applyDither(uint8_t *page,const BlobPart &part) {memcpy(page+part.offset,gen12Dither420v+part.source,part.size);}
 
+// EXPERIMENT (-wex-tgl-vp9): the decoder factory has no VP9 case; subtype 0x1000 falls to
+// the skip branch at 0x144e2 (jne 0x149a5). Point that branch at a stub in the header pad
+// (0xC70, inside the zero gap 0xC6E-0xD2F) that calls WEXVP9Create from
+// @loader_path/WEXVP9.dylib. A decoder continues at 0x149a5; no library, no symbol or a
+// NULL result fails through the factory's error exit 0x15072 (ebx = 1). Each page is admitted
+// only when its whole original content has the expected FNV-1a hash, so the branch can
+// never be patched without the matching stub page of the same binary.
+// Stub source: tools/vp9/factory-stub.s; bytes: tools/vp9/gen-stub.py.
+struct PagePatch {uint64_t page; uint64_t hash; size_t offset; size_t size; const uint8_t *bytes;};
+constexpr uint8_t vp9Stub[] {
+ 0x48,0x3d,0x00,0x10,0x00,0x00,0x0f,0x85,0x29,0x3d,0x01,0x00,0x49,0x8b,0x01,0x4a,
+ 0x83,0x3c,0xf8,0x00,0x0f,0x85,0x1b,0x3d,0x01,0x00,0x56,0x41,0x51,0x41,0x50,0x57,
+ 0x52,0x51,0x41,0x52,0x41,0x53,0x48,0x8d,0x3d,0x4e,0x00,0x00,0x00,0xbe,0x02,0x00,
+ 0x00,0x00,0xe8,0xd9,0xd6,0x23,0x00,0x48,0x85,0xc0,0x74,0x20,0x48,0x89,0xc7,0x48,
+ 0x8d,0x35,0x4f,0x00,0x00,0x00,0xe8,0xcb,0xd6,0x23,0x00,0x48,0x85,0xc0,0x74,0x0c,
+ 0x48,0x8b,0xbd,0x98,0xfe,0xff,0xff,0x4c,0x89,0xf6,0xff,0xd0,0x41,0x5b,0x41,0x5a,
+ 0x59,0x5a,0x5f,0x41,0x58,0x41,0x59,0x5e,0x48,0x85,0xc0,0x0f,0x85,0xc4,0x3c,0x01,
+ 0x00,0xbb,0x01,0x00,0x00,0x00,0xe9,0x87,0x43,0x01,0x00,0x40,0x6c,0x6f,0x61,0x64,
+ 0x65,0x72,0x5f,0x70,0x61,0x74,0x68,0x2f,0x57,0x45,0x58,0x56,0x50,0x39,0x2e,0x64,
+ 0x79,0x6c,0x69,0x62,0x00,0x57,0x45,0x58,0x56,0x50,0x39,0x43,0x72,0x65,0x61,0x74,
+ 0x65,0x00,
+};
+constexpr uint64_t vp9Cave=0xc70, vp9CaveEnd=0xd30, vp9Branch=0x144e2;
+// jne rel32 from the branch's next instruction (0x144e8) to the stub.
+constexpr uint8_t vp9Jump[] {0x0f,0x85,
+ uint8_t(vp9Cave-(vp9Branch+6)),uint8_t((vp9Cave-(vp9Branch+6))>>8),uint8_t((vp9Cave-(vp9Branch+6))>>16),uint8_t((vp9Cave-(vp9Branch+6))>>24)};
+// AppleGVA asks for a decode context only among the configs the driver advertises. The MFX
+// engine's lists (built from 0x754e20 at 0x2bd0c) have no type 1 / subtype 0x1000 entry, so
+// VP9 context creation fails before the factory. ICL's MFX list 13 is that entry. Rewrite
+// TGL's type 1 / 0x40 descriptor (MFX list 4, 0x78bd30; an MPEG-era subtype AppleGVA has no
+// flow for) into ICL's VP9 descriptor, in TGL's layout (ICL has 8 more bytes after +0x18):
+// subtype 0x1000, rate 0x2d000000, input braw, outputs NV12 x420 420f xf20 (flags 5).
+// The descriptor is plain data. AppleGVA requests VP9 as that one node alone, and the
+// factory needs a list that ends with it too, but list 4 continues with 16/1 and the
+// builder reads exactly 13 lists. So MFX list 6 (a lone 16/1 that no decode requests;
+// H.264 and HEVC were traced) points at the descriptor instead. Slot 0x754eb0 is rebased,
+// so it keeps holding an image pointer and dyld slides it as before.
+constexpr uint64_t vp9Descriptor=0x78bd30;
+constexpr uint64_t vp9ListSlot=0x754eb0, vp9ListPage=vp9ListSlot&~0xfffULL, vp9ListHash=0x89ed4abf7988dd93ULL;
+constexpr uint8_t vp9ListPointer[] {0x30,0xbd,0x78,0x00,0x00,0x00,0x00,0x00}; // vp9Descriptor
+constexpr uint8_t vp9Subtype[] {0x00,0x10,0x00,0x00};
+constexpr uint8_t vp9Rate[] {0x00,0x00,0x00,0x2d};
+constexpr uint8_t vp9OutputCount[] {0x04,0x00,0x00,0x00};
+constexpr uint8_t vp9Outputs[] { // x420, 420f, xf20 after the existing NV12 (5 = same flags)
+ 0x30,0x32,0x34,0x78,0x05,0x00,0x00,0x00, 0x66,0x30,0x32,0x34,0x05,0x00,0x00,0x00, 0x30,0x32,0x66,0x78,0x05,0x00,0x00,0x00};
+constexpr uint64_t vp9DescriptorPage=vp9Descriptor&~0xfffULL, vp9DescriptorHash=0x1997b8aac85bb583ULL;
+constexpr PagePatch vp9Patches[] {
+ {0x0,0x887a796c0f479e7fULL,vp9Cave,sizeof(vp9Stub),vp9Stub},
+ {0x14000,0xb70de16edd242bebULL,vp9Branch-0x14000,sizeof(vp9Jump),vp9Jump},
+ {vp9DescriptorPage,vp9DescriptorHash,(vp9Descriptor&0xfff)+0x8,sizeof(vp9Subtype),vp9Subtype},
+ {vp9DescriptorPage,vp9DescriptorHash,(vp9Descriptor&0xfff)+0x18,sizeof(vp9Rate),vp9Rate},
+ {vp9DescriptorPage,vp9DescriptorHash,(vp9Descriptor&0xfff)+0x224,sizeof(vp9OutputCount),vp9OutputCount},
+ {vp9DescriptorPage,vp9DescriptorHash,(vp9Descriptor&0xfff)+0x230,sizeof(vp9Outputs),vp9Outputs},
+ {vp9ListPage,vp9ListHash,vp9ListSlot&0xfff,sizeof(vp9ListPointer),vp9ListPointer},
+};
+// A page is admitted when its whole original content has the expected hash; every piece
+// for that page is then written together.
+inline bool vp9Part(const void *page,uint64_t offset,bool validated,bool tainted,const char *build) {
+ if(!page || !validated || tainted || !build || strcmp(build,supportedBuild))return false;
+ for(const auto &part:vp9Patches)
+  if(part.page==offset)return fnv1a(static_cast<const uint8_t *>(page),0x1000)==part.hash;
+ return false;
+}
+inline void applyVP9(uint8_t *page,uint64_t offset) {
+ for(const auto &part:vp9Patches)if(part.page==offset)memcpy(page+part.offset,part.bytes,part.size);
+}
+
 // Creating a counter sample buffer crashes in MTLIGCounterSampleBuffer::Init,
 // and the method's error path writes through a caller's null error pointer.
 // -[MTLIGAccelDevice counterSets] and -newCounterSampleBufferWithDescriptor:error:

@@ -173,9 +173,94 @@ int main(int argc,char **argv) {
   }
   puts("PASS: installed Metal driver satisfies the counter and posh sites");
  }
+ // VP9 factory route: the stub fits its gap, every jump lands where the source says,
+ // and each page is admitted only as the exact original page of the installed binary.
+ static_assert(vp9Cave+sizeof(vp9Stub)<=vp9CaveEnd,"stub fits the header-pad gap");
+ {int32_t rel; memcpy(&rel,vp9Jump+2,4); assert(vp9Jump[0]==0x0f && vp9Jump[1]==0x85 && int64_t(vp9Branch)+6+rel==int64_t(vp9Cave));}
+ {int32_t rel; memcpy(&rel,vp9Stub+8,4); assert(vp9Stub[6]==0x0f && vp9Stub[7]==0x85 && int64_t(vp9Cave)+12+rel==0x149a5);}  // other subtypes
+ {int32_t rel; memcpy(&rel,vp9Stub+0x6d,4); assert(vp9Stub[0x6b]==0x0f && vp9Stub[0x6c]==0x85 && int64_t(vp9Cave)+0x71+rel==0x149a5);} // a decoder
+ {int32_t rel; memcpy(&rel,vp9Stub+0x77,4); assert(vp9Stub[0x71]==0xbb && vp9Stub[0x72]==1 && vp9Stub[0x76]==0xe9 && int64_t(vp9Cave)+0x7b+rel==0x15072);} // ebx=1, error exit
+ {int32_t rel; memcpy(&rel,vp9Stub+0x33,4); assert(vp9Stub[0x32]==0xe8 && int64_t(vp9Cave)+0x37+rel==0x23e380);}            // _dlopen stub
+ {int32_t rel; memcpy(&rel,vp9Stub+0x47,4); assert(vp9Stub[0x46]==0xe8 && int64_t(vp9Cave)+0x4b+rel==0x23e386);}            // _dlsym stub
+ assert(!strcmp(reinterpret_cast<const char *>(vp9Stub+0x7b),"@loader_path/WEXVP9.dylib"));
+ assert(!strcmp(reinterpret_cast<const char *>(vp9Stub+0x7b+26),"WEXVP9Create"));
+ memset(page,0,sizeof(page));
+ for(auto &part:vp9Patches) assert(!vp9Part(page,part.page,true,false,"25G332")); // Any other content is refused.
+ for(auto &part:vp9Patches) assert(part.offset+part.size<=0x1000);                 // Every piece stays in its page.
+ if(argc>3) {
+  {
+   // The error exit the stub fails through: leaq -0x1b0(%rbp),%rdx; movl $0,(%rdx) (release
+   // the perf capability), then free and return ebx.
+   const uint8_t exit[]={0x48,0x8d,0x95,0x50,0xfe,0xff,0xff,0xc7,0x02,0x00,0x00,0x00,0x00};
+   uint8_t at[sizeof(exit)]; FILE *f=fopen(argv[3],"rb"); assert(f); assert(!fseek(f,0x15072,SEEK_SET));
+   assert(fread(at,1,sizeof(at),f)==sizeof(at)); fclose(f); assert(!memcmp(at,exit,sizeof(exit)));
+  }
+  const uint64_t pages[]={0x0,0x14000,vp9DescriptorPage,vp9ListPage};
+  for(uint64_t at:pages) {
+   FILE *f=fopen(argv[3],"rb"); assert(f); assert(!fseek(f,at,SEEK_SET)); assert(fread(page,1,sizeof(page),f)==sizeof(page)); fclose(f);
+   // With -wex-tgl-vp9 a read returns the patched page from the unified buffer cache.
+   bool patched=true;
+   for(auto &part:vp9Patches) if(part.page==at && memcmp(page+part.offset,part.bytes,part.size)) patched=false;
+   if(patched) continue;
+   // A page 0 still holding an earlier stub build: the gap was all zero, so zeroing the
+   // cave gives back the original page, which the whole-page hash then has to confirm.
+   if(at==0 && !vp9Part(page,at,true,false,"25G332")) memset(page+vp9Cave,0,vp9CaveEnd-vp9Cave);
+   assert(vp9Part(page,at,true,false,"25G332"));
+   assert(!vp9Part(page,at+0x1000,true,false,"25G332"));
+   assert(!vp9Part(page,at,true,false,"25G241"));
+   assert(!vp9Part(page,at,false,false,"25G332"));
+   assert(!vp9Part(page,at,true,true,"25G332"));
+   if(at==0) for(size_t i=0xc6e;i<vp9CaveEnd;++i) assert(!page[i]); // The gap is free.
+   if(at==0x14000) {const uint8_t original[]={0x0f,0x85,0xbd,0x04,0x00,0x00}; assert(!memcmp(page+0x4e2,original,6));} // jne 0x149a5
+   if(at==vp9ListPage) {
+    // MFX list 6 is the lone 16/1 node: a NULL before and after the slot, which holds 0x78b0a0.
+    uint64_t slot[3]; memcpy(slot,page+(vp9ListSlot&0xfff)-8,sizeof(slot));
+    assert(!slot[0] && slot[1]==0x78b0a0 && !slot[2]);
+   }
+   uint8_t before[sizeof(page)]; memcpy(before,page,sizeof(page));
+   applyVP9(page,at);
+   size_t changed=0;
+   for(size_t i=0;i<sizeof(page);++i) if(page[i]!=before[i]) {
+    bool inside=false;
+    for(auto &part:vp9Patches) if(part.page==at && i>=part.offset && i<part.offset+part.size) inside=true;
+    assert(inside); ++changed;                                       // Nothing outside the pieces moves.
+   }
+   assert(changed);
+   assert(!vp9Part(page,at,true,false,"25G332"));                    // One pass only.
+   if(at==vp9ListPage) {uint64_t slot; memcpy(&slot,page+(vp9ListSlot&0xfff),8); assert(slot==vp9Descriptor);} // List 6 is VP9 alone.
+   if(at==vp9DescriptorPage) {
+    // The rewritten descriptor equals ICL's VP9 descriptor (MFX list 13), whose fields after
+    // +0x18 sit 8 bytes later (ICL has a second rate field at +0x20).
+    const uint8_t *tgl=page+(vp9Descriptor&0xfff);
+    uint32_t sub,count; memcpy(&sub,tgl+8,4); memcpy(&count,tgl+0x224,4);
+    assert(sub==0x1000 && count==4);
+    if(argc>5) {
+     static uint8_t icl[0x438];
+     FILE *g=fopen(argv[5],"rb"); assert(g); assert(!fseek(g,0x7c41d0,SEEK_SET)); assert(fread(icl,1,sizeof(icl),g)==sizeof(icl)); fclose(g);
+     assert(!memcmp(tgl,icl,0x20));                                   // type, subtype, engine, rate
+     // The descriptor runs past this page: the in-page part comes from the patched page,
+     // the rest (unchanged by the patch) from the file's next page.
+     const size_t inPage=0x1000-(vp9Descriptor&0xfff);
+     assert(!memcmp(tgl+0x20,icl+0x28,inPage-0x20));                  // input and output format lists
+     static uint8_t rest[0x428];
+     FILE *h=fopen(argv[3],"rb"); assert(h); assert(!fseek(h,vp9DescriptorPage+0x1000,SEEK_SET));
+     assert(fread(rest,1,0x428-inPage,h)==0x428-inPage); fclose(h);
+     assert(!memcmp(rest,icl+inPage+8,0x428-inPage));
+     puts("PASS: rewritten TGL descriptor equals ICL's VP9 descriptor");
+    }
+   }
+  }
+  puts("PASS: installed video driver holds the original VP9 pages (skip branch, free gap, MPEG descriptor, lone 16/1 list)");
+ }
  puts("PASS: descriptor gates are exact, validated-only and build-bound");
 }
 '''
+# The VP9 stub bytes in the policy header are exactly what factory-stub.s assembles to.
+import re
+policy = (root/'WhateverXe/kern_tahoe_descriptor_policy.hpp').read_text()
+stub = re.search(r'constexpr uint8_t vp9Stub\[\] \{(.*?)\};', policy, re.S).group(1)
+assembled = subprocess.check_output(['python3', str(root/'tools/vp9/gen-stub.py'), '--bytes'], text=True).strip()
+assert bytes(int(x, 16) for x in re.findall(r'0x[0-9a-f]{2}', stub)).hex() == assembled, 'regenerate vp9Stub with tools/vp9/gen-stub.py'
 installed = pathlib.Path('/Library/GPUBundles/AppleIntelTGLGraphicsMTLDriver.bundle/Contents/MacOS/impostor.dylib')
 with tempfile.TemporaryDirectory(prefix='tahoe-descriptor-') as temp:
     p = pathlib.Path(temp); (p/'t.cpp').write_text(harness)
@@ -183,4 +268,5 @@ with tempfile.TemporaryDirectory(prefix='tahoe-descriptor-') as temp:
     video = pathlib.Path('/Library/GPUBundles/AppleIntelTGLGraphicsVADriver.bundle/Contents/MacOS/TGLVA')
     driver = video.with_name('AppleIntelTGLGraphicsVADriver')
     metal = installed.with_name('AppleIntelTGLGraphicsMTLDriver')
-    subprocess.run([str(p/'t')]+([str(installed),str(video),str(driver),str(metal)] if installed.exists() and video.exists() and driver.exists() and metal.exists() else []),check=True)
+    icl = pathlib.Path('/System/Library/Extensions/AppleIntelICLGraphicsVADriver.bundle/Contents/MacOS/AppleIntelICLGraphicsVADriver')
+    subprocess.run([str(p/'t')]+([str(installed),str(video),str(driver),str(metal)]+([str(icl)] if icl.exists() else []) if installed.exists() and video.exists() and driver.exists() and metal.exists() else []),check=True)
