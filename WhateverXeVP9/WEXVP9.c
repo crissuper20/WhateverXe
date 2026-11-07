@@ -13,13 +13,15 @@
 // the same context and uses its Intel HCP/MI/VDENC command builders to build each frame's
 // VP9 commands into a plain memory buffer, which is logged and never submitted; address
 // fields get numbered placeholders.
-// With WEXVP9.submit also present, the session's first frame, when it is a key frame whose
-// log-only build succeeded, is built again into the OS command buffer with real addresses
-// and submitted to the GPU once. Later frames stay log-only.
+// With WEXVP9.submit also present, every frame whose log-only build succeeded is built
+// again into the OS command buffer with real addresses, submitted to the GPU and waited
+// for. The first failure (or a frame the port does not handle yet, such as segmentation)
+// stops GPU runs for the session; later frames stay log-only.
 #include <dlfcn.h>
 #include <mach-o/dyld.h>
 #include <mach-o/loader.h>
 #include <mach/mach.h>
+#include <mach/mach_time.h>
 #include <os/log.h>
 #include <stdint.h>
 #include <stdlib.h>
@@ -264,9 +266,11 @@ struct Previous {
 	uint32_t width, height;
 };
 
-// Internal buffers, allocated through the hidden decoder for one frame size: name, the
-// GetVp9BufferSize type (-1 = probability buffer, 0x1000 bytes as iHD) and the
-// PIPE_BUF_ADDR params field that points at it.
+// Internal buffers, allocated through the hidden decoder: name, the GetVp9BufferSize type
+// (-1 = probability buffer, 0x1000 bytes as iHD) and the PIPE_BUF_ADDR params field that
+// points at it (0: chosen per frame). Sized buffers follow the frame size; the four
+// probability buffers (one per VP9 frame context) are allocated once and keep their
+// contents, as iHD's.
 static const struct {
 	const char *name;
 	int type;
@@ -274,19 +278,30 @@ static const struct {
 } buffers[] = {
 	{"WEXVP9DeblockLine", 0, 0xf0}, {"WEXVP9DeblockTileLine", 1, 0x2f0}, {"WEXVP9DeblockTileColumn", 2, 0x2f8},
 	{"WEXVP9MetadataLine", 4, 0x300}, {"WEXVP9MetadataTileLine", 5, 0x308}, {"WEXVP9MetadataTileColumn", 6, 0x310},
-	{"WEXVP9CurrentMvTemporal", 13, 0x330}, {"WEXVP9Probability", -1, 0x3c8}, {"WEXVP9SegmentId", 20, 0x3d0},
-	{"WEXVP9HvdLine", 21, 0x3d8}, {"WEXVP9HvdTile", 22, 0x3e0},
+	{"WEXVP9SegmentId", 20, 0x3d0}, {"WEXVP9HvdLine", 21, 0x3d8}, {"WEXVP9HvdTile", 22, 0x3e0},
+	{"WEXVP9MvTemporal0", 13, 0}, {"WEXVP9MvTemporal1", 13, 0},
+	{"WEXVP9Probability0", -1, 0}, {"WEXVP9Probability1", -1, 0}, {"WEXVP9Probability2", -1, 0}, {"WEXVP9Probability3", -1, 0},
 };
-enum { BufferCount = sizeof(buffers) / sizeof(buffers[0]), MvTemporal = 6, Probability = 7 };
+enum {
+	BufferCount = sizeof(buffers) / sizeof(buffers[0]),
+	SegmentId = 6,
+	MvTemporal0 = 9,   // two, alternating: current and previous (collocated) motion vectors
+	Probability0 = 11, // four frame contexts
+	PbaCurrentMv = 0x330, PbaCollocatedMv = 0x338, PbaProbability = 0x3c8,
+};
 
 struct Hidden {
 	void *hevc;
 	void *context;
 	uint32_t frame;
-	int submit, submitted; // WEXVP9.submit present; the one GPU run was tried
+	int submit, stopped; // WEXVP9.submit present; GPU runs stopped for this session
 	struct Previous prev;
 	uint32_t bufferWidth, bufferHeight; // frame size the buffers were allocated for
 	uint8_t allocated[BufferCount];
+	uint32_t size[BufferCount];
+	// Probability buffer bookkeeping, as iHD's DetermineInternalBufferUpdate.
+	uint8_t pendingFull[4], pendingPartial, interSaved, currentMv;
+	uint8_t interProbs[Vp9SegProbOffset - Vp9InterProbOffset];
 	uint8_t resource[BufferCount][ResourceSize];
 };
 
@@ -300,25 +315,41 @@ static void *field(const void *object, uint32_t offset) {
 	return *(void *const *)((const uint8_t *)object + offset);
 }
 
-static void freeBuffers(struct Hidden *hidden) {
+// Frees the sized buffers, and the probability buffers too when all is set.
+static void freeBuffers(struct Hidden *hidden, int all) {
 	void *os = osInterface(hidden->hevc);
 	Call2 freeResource = (Call2)field(os, OsFreeResource);
-	for (int i = 0; i < BufferCount; ++i)
+	for (int i = 0; i < BufferCount; ++i) {
+		if (buffers[i].type < 0 && !all) continue;
 		if (hidden->allocated[i] && freeResource) freeResource(os, hidden->resource[i]);
-	memset(hidden->allocated, 0, sizeof(hidden->allocated));
-	memset(hidden->resource, 0, sizeof(hidden->resource));
+		hidden->allocated[i] = 0;
+		memset(hidden->resource[i], 0, ResourceSize);
+	}
 	hidden->bufferWidth = hidden->bufferHeight = 0;
+}
+
+// CPU pointer to one of our buffers through Apple's CodechalResLock (write-only lock, as
+// iHD uses for these updates); NULL when it fails. unmapBuffer ends the lock either way.
+static uint8_t *mapBuffer(struct Hidden *hidden, int index, uint8_t lock[0x40]) {
+	memset(lock, 0, 0x40);
+	((void (*)(void *, void *, void *))(vaBase + ResLockInit))(lock, osInterface(hidden->hevc), hidden->resource[index]);
+	return ((uint8_t *(*)(void *, int))(vaBase + ResLockMap))(lock, 2);
+}
+
+static void unmapBuffer(uint8_t lock[0x40]) {
+	((void (*)(void *))(vaBase + ResLockDone))(lock);
 }
 
 // Allocates the internal buffers for this frame size (once per size) with Apple's own
 // size helper and allocator. Returns 0 when one fails.
 static int allocateBuffers(struct Hidden *hidden, uint32_t width, uint32_t height) {
 	if (hidden->bufferWidth == width && hidden->bufferHeight == height) return 1;
-	freeBuffers(hidden);
+	freeBuffers(hidden, 0);
 	void *codechal = *(void **)((uint8_t *)hidden->hevc + HevcCodechal);
 	void *hcp = *(void **)((uint8_t *)codechal + CodechalHcp);
 	int ok = 1;
 	for (int i = 0; i < BufferCount; ++i) {
+		if (hidden->allocated[i]) continue; // a kept probability buffer
 		// MHW_VDBOX_HCP_BUFFER_SIZE_PARAMS: +0 max bit depth, +1 chroma format, +8/+0xc
 		// width/height in 64-pixel superblocks, +0x10 size out.
 		uint8_t sizeParams[0x20] = {0};
@@ -336,8 +367,19 @@ static int allocateBuffers(struct Hidden *hidden, uint32_t width, uint32_t heigh
 			codechal, hidden->resource[i], size, buffers[i].name, 1, 0); // zero filled
 		os_log(wexLog(), "WEXVP9 batch: buffer %{public}s type %d size 0x%x size status %d alloc status %d", buffers[i].name,
 			buffers[i].type, size, status, alloc);
-		if (status || alloc) ok = 0;
-		else hidden->allocated[i] = 1;
+		if (status || alloc) {
+			ok = 0;
+			continue;
+		}
+		hidden->allocated[i] = 1;
+		hidden->size[i] = size;
+		if (buffers[i].type < 0) { // segment tree and prediction probabilities start at 255, as iHD
+			uint8_t lock[0x40];
+			uint8_t *data = mapBuffer(hidden, i, lock);
+			if (data) memset(data + Vp9SegProbOffset, 255, 10);
+			else ok = 0;
+			unmapBuffer(lock);
+		}
 	}
 	hidden->bufferWidth = width;
 	hidden->bufferHeight = height;
@@ -418,6 +460,77 @@ static int placeholderAddress(void *os, void *cmd, uint8_t *params) {
 	return 0;
 }
 
+// Per-frame buffer state, ported from Intel media-driver's DetermineInternalBufferUpdate,
+// ProbBufferPartialUpdatewithDrv and the MV buffer rotation (MIT, LICENSE-media-driver),
+// without segmentation (such frames are not submitted). Picks the probability buffer of
+// this frame (context 0 for key, intra-only and error-resilient frames), resets or
+// restores its contents as iHD does, zeroes the segment id buffer when iHD does and
+// rotates the motion vector buffers for inter frames. Returns the frame context index,
+// -1 when a buffer could not be locked.
+static int updateBuffers(struct Hidden *hd, int key, int intra, int errorRes, int resetCtx, int ctx, int scaling) {
+	int resetAll = key || errorRes || (resetCtx == 3 && intra);
+	int resetSpecified = resetCtx == 2 && intra;
+	int index = key || intra || errorRes ? 0 : ctx;
+	int full = 0, partial = 0, save = 0, restore = 0;
+	if (resetAll) {
+		full = 1;
+		hd->pendingPartial = (uint8_t)(key || intra);
+		for (int i = 1; i < 4; ++i) hd->pendingFull[i] = 1;
+		hd->interSaved = 0;
+	} else if (resetSpecified && ctx == 0) {
+		full = 1;
+		hd->pendingPartial = 1;
+		hd->interSaved = 0;
+	} else if (resetSpecified || intra) {
+		if (resetSpecified) hd->pendingFull[ctx] = 1;
+		if (!hd->pendingPartial) {
+			if (!hd->interSaved) save = hd->interSaved = 1;
+			partial = 1;
+		}
+	} else if (hd->pendingFull[ctx]) {
+		full = 1;
+		hd->pendingFull[ctx] = 0;
+	} else if (ctx == 0 && hd->pendingPartial) {
+		partial = 1;
+		hd->pendingPartial = 0;
+	} else if (ctx == 0 && hd->interSaved) {
+		restore = 1;
+		hd->interSaved = 0;
+	}
+	int ok = 1;
+	if (full || partial || save || restore) {
+		uint8_t lock[0x40];
+		uint8_t *data = mapBuffer(hd, Probability0 + index, lock);
+		const uint8_t *defaults = key || intra ? vp9KeyProbs : vp9InterProbs;
+		if (!data) ok = 0;
+		else {
+			if (save) memcpy(hd->interProbs, data + Vp9InterProbOffset, sizeof(hd->interProbs));
+			if (full) {
+				memcpy(data, defaults, Vp9SegProbOffset);
+				memset(data + Vp9SegProbOffset + 10, 0, Vp9ProbSize - Vp9SegProbOffset - 10);
+			} else if (partial) {
+				for (int r = 0; r < 2; ++r) {
+					uint16_t first = vp9PartialReset[key || intra ? 0 : 1][r][0], end = vp9PartialReset[key || intra ? 0 : 1][r][1];
+					memcpy(data + first, defaults + first, end - first);
+				}
+			}
+			if (restore) memcpy(data + Vp9InterProbOffset, hd->interProbs, sizeof(hd->interProbs));
+		}
+		unmapBuffer(lock);
+	}
+	if (key || scaling || errorRes || intra) {
+		uint8_t lock[0x40];
+		uint8_t *data = mapBuffer(hd, SegmentId, lock);
+		if (data) memset(data, 0, hd->size[SegmentId]);
+		else ok = 0;
+		unmapBuffer(lock);
+	}
+	if (!key && !intra) hd->currentMv ^= 1;
+	os_log(wexLog(), "WEXVP9 batch: probability context %d full %d partial %d save %d restore %d, current mv %u", index, full,
+		partial, save, restore, hd->currentMv);
+	return ok ? index : -1;
+}
+
 // One frame's command parameters, built once and emitted into either buffer.
 struct Commands {
 	void *hcp, *mi, *vdenc;
@@ -450,31 +563,21 @@ static int allZero(const int *v, int count) {
 	return 1;
 }
 
-// The single GPU run, in the order Apple's HEVC decode uses: key-frame probabilities
-// into the probability buffer, set the GPU context, get the command buffer, prolog with
-// frame tracking, the frame's commands, MI_BATCH_BUFFER_END, return, submit. A builder
+// One GPU run, in the order Apple's HEVC decode uses: set the GPU context, get the
+// command buffer, prolog with frame tracking, the frame's commands, MI_BATCH_BUFFER_END,
+// return, submit; then a read lock of the output surface waits for the GPU. A builder
 // failing here rewinds the buffer to just after the prolog, so only the prolog and the
-// batch end run.
-static void submitFrame(struct Hidden *hidden, const struct Commands *c, uint32_t frame) {
-	hidden->submitted = 1;
-	const uint8_t *data;
-	memcpy(&data, (const uint8_t *)hidden->context + 0x90, 8);
-	if (!data || data[1] != 0x49 || data[2] != 0x83 || data[3] != 0x42) {
-		os_log(wexLog(), "WEXVP9 submit frame=%u: bitstream does not start with a key frame sync code (%02x %02x %02x %02x), "
+// batch end run. Any failure stops GPU runs for the session.
+static void submitFrame(struct Hidden *hidden, const struct Commands *c, uint32_t frame, int key, void *output,
+	const uint8_t *data) {
+	hidden->stopped = 1; // until this run succeeds
+	if (!data || (key && (data[1] != 0x49 || data[2] != 0x83 || data[3] != 0x42))) {
+		os_log(wexLog(), "WEXVP9 submit frame=%u: bitstream missing or key frame without sync code (%02x %02x %02x %02x), "
 			"not submitted", frame, data ? data[0] : 0, data ? data[1] : 0, data ? data[2] : 0, data ? data[3] : 0);
 		return;
 	}
 	void *codechal = *(void **)((uint8_t *)hidden->hevc + HevcCodechal);
 	void *os = osInterface(hidden->hevc);
-	uint8_t lock[0x40] = {0};
-	((void (*)(void *, void *, void *))(vaBase + ResLockInit))(lock, os, hidden->resource[Probability]);
-	uint8_t *probs = ((uint8_t *(*)(void *, int))(vaBase + ResLockMap))(lock, 2);
-	if (probs) memcpy(probs, vp9KeyProbs, sizeof(vp9KeyProbs));
-	((void (*)(void *))(vaBase + ResLockDone))(lock);
-	if (!probs) {
-		os_log(wexLog(), "WEXVP9 submit frame=%u: probability buffer lock failed, not submitted", frame);
-		return;
-	}
 	uint32_t gpuContext;
 	memcpy(&gpuContext, (uint8_t *)codechal + CodechalGpuContext, 4);
 	int context = ((int (*)(void *, uint32_t))field(os, OsSetGpuContext))(os, gpuContext);
@@ -498,9 +601,20 @@ static void submitFrame(struct Hidden *hidden, const struct Commands *c, uint32_
 	memcpy(&used, cmd + 0x158, 4);
 	((int (*)(void *, void *, int))field(os, OsReturnCommandBuffer))(os, cmd, 0);
 	int submit = ((int (*)(void *, void *, int))field(os, OsSubmitCommandBuffer))(os, cmd, 0);
+	static int (*surfaceLock)(void *, uint32_t, uint32_t *), (*surfaceUnlock)(void *, uint32_t, uint32_t *);
+	if (!surfaceLock) surfaceLock = (int (*)(void *, uint32_t, uint32_t *))dlsym(RTLD_DEFAULT, "IOSurfaceLock");
+	if (!surfaceUnlock) surfaceUnlock = (int (*)(void *, uint32_t, uint32_t *))dlsym(RTLD_DEFAULT, "IOSurfaceUnlock");
+	uint64_t start = mach_absolute_time();
+	int wait = surfaceLock && surfaceUnlock ? surfaceLock(output, 1, NULL) : -1; // kIOSurfaceLockReadOnly
+	if (!wait) surfaceUnlock(output, 1, NULL);
+	mach_timebase_info_data_t timebase;
+	mach_timebase_info(&timebase);
+	uint64_t waited = (mach_absolute_time() - start) * timebase.numer / timebase.denom / 1000;
+	if (built && !submit && !wait) hidden->stopped = 0;
 	os_log(wexLog(), "WEXVP9 submit frame=%u: context %u prolog %d status=%d/%d/%d/%d/%d/%d/%d/%d surface/addr/ind=%d/%d/%d "
-		"%{public}s end %d bytes %u submit %d", frame, gpuContext, prolog, st[0], st[1], st[2], st[3], st[4], st[5], st[6], st[7],
-		r[0], r[4], r[5], built ? "frame built" : "BUILD FAILED, prolog only", end, used, submit);
+		"%{public}s end %d bytes %u submit %d wait %d (%llu us)", frame, gpuContext, prolog, st[0], st[1], st[2], st[3], st[4], st[5],
+		st[6], st[7], r[0], r[4], r[5], built ? "frame built" : "BUILD FAILED, prolog only", end, used, submit, wait,
+		(unsigned long long)waited);
 }
 
 // Builds one frame's commands from AppleGVA's request (layout in logRequest) and logs
@@ -606,6 +720,7 @@ static void buildBatch(struct Hidden *hidden, const uint8_t *req) {
 	int sv[4] = {0, 0, 0, 0};
 	void *ioSurface;
 	memcpy(&ioSurface, req + 0x1250, 8);
+	void *output = ioSurface;
 	sv[0] = surfaceFor(hevc, ioSurface, surfaces[0], "output");
 	for (int r = 0; inter && r < 3; ++r) {
 		memcpy(&ioSurface, req + 0x1260 + slots[r] * 0x1258 + 0x1250, 8);
@@ -621,8 +736,16 @@ static void buildBatch(struct Hidden *hidden, const uint8_t *req) {
 	*(uint32_t *)(stream + 0x1c) = 4;
 	*(uint32_t *)(stream + 0x38) = ((uint32_t (*)(void *, int))(vaBase + BitstreamId))(context + 0x80, 0);
 	memcpy(stream + 0x50, context + 0x90, 8);
-	os_log(wexLog(), "WEXVP9 batch frame=%u bitstream context size %u request bytes %u id %u buffers %d", frame, streamSize,
-		bytes, *(uint32_t *)(stream + 0x38), buffersOk);
+	// The request's +0x0 points at this frame's data inside the context's buffer (frames of
+	// a superframe follow each other); the offset from the buffer start goes to IND_OBJ, as
+	// Ice Lake's VP9 decoder computes it.
+	const uint8_t *data, *base;
+	memcpy(&data, req, 8);
+	memcpy(&base, context + 0x90, 8);
+	uint64_t offset = data >= base ? (uint64_t)(data - base) : ~0ull;
+	int streamOk = data && base && offset + bytes <= streamSize;
+	os_log(wexLog(), "WEXVP9 batch frame=%u bitstream context size %u request bytes %u offset %llu id %u buffers %d", frame,
+		streamSize, bytes, (unsigned long long)offset, *(uint32_t *)(stream + 0x38), buffersOk);
 
 	// MHW_VDBOX_SURFACE_PARAMS: +0 mode, +8 surface, +0x11 chroma type (1 = 4:2:0), +0x12
 	// surface id (0 decoded, 2 LAST, 3 GOLDEN, 4 ALTREF).
@@ -644,13 +767,20 @@ static void buildBatch(struct Hidden *hidden, const uint8_t *req) {
 	*(void **)((uint8_t *)pba + 0x10) = surfaces[0];
 	for (int i = 0; i < 8; ++i) *(void **)((uint8_t *)pba + 0x68 + 8 * i) = inter && i < 3 ? surfaces[1 + i] : surfaces[0];
 	for (int i = 0; i < BufferCount; ++i)
-		if (hidden->allocated[i] && (i != MvTemporal || inter))
-			*(void **)((uint8_t *)pba + buffers[i].field) = hidden->resource[i];
+		if (hidden->allocated[i] && buffers[i].field) *(void **)((uint8_t *)pba + buffers[i].field) = hidden->resource[i];
+	int scaling = prev->width != width || prev->height != height;
+	int probIndex = buffersOk ? updateBuffers(hidden, key, intra, h[0x07] & 1, h[0x0d] & 3, h[0x19] & 3, scaling) : -1;
+	if (probIndex >= 0) *(void **)((uint8_t *)pba + PbaProbability) = hidden->resource[Probability0 + probIndex];
+	if (inter) { // iHD: current MV buffer for inter frames, the previous one when that frame was inter too
+		*(void **)((uint8_t *)pba + PbaCurrentMv) = hidden->resource[MvTemporal0 + hidden->currentMv];
+		if (!(prev->flags & 3)) *(void **)((uint8_t *)pba + PbaCollocatedMv) = hidden->resource[MvTemporal0 + (hidden->currentMv ^ 1)];
+	}
 	// MHW_VDBOX_IND_OBJ_BASE_ADDR_PARAMS: +0 mode, +8 bitstream, +0x10 size, +0x14 offset.
 	uint8_t ind[0x80] = {0};
 	*(uint32_t *)ind = ModeVp9Vld;
 	*(void **)(ind + 0x8) = stream;
 	*(uint32_t *)(ind + 0x10) = bytes;
+	*(uint32_t *)(ind + 0x14) = streamOk ? (uint32_t)offset : 0;
 
 	static struct CommandBuffer cmd;
 	initCommandBuffer(&cmd);
@@ -659,7 +789,7 @@ static void buildBatch(struct Hidden *hidden, const uint8_t *req) {
 	*addResource = (void *)placeholderAddress;
 	placeholders = surfacePatches = 0;
 	struct Commands c = {hcp, mi, vdenc, vdInit, pms, pba, ind, segState, picState, bsd, vdFlush, &pipeFlush, flushDw,
-		surfaceParams, inter ? 4 : 1, {sv[0], sv[1], sv[2], sv[3]}, buffersOk, streamSize >= bytes};
+		surfaceParams, inter ? 4 : 1, {sv[0], sv[1], sv[2], sv[3]}, buffersOk, streamOk};
 	int s[8], r[6];
 	emit(&c, &cmd, s, r);
 	*addResource = appleAddResource;
@@ -674,8 +804,14 @@ static void buildBatch(struct Hidden *hidden, const uint8_t *req) {
 		text[9 * count - 1] = 0;
 		os_log(wexLog(), "WEXVP9 batch frame=%u +%03x: %{public}s", frame, at, text);
 	}
-	if (hidden->submit && !hidden->submitted && frame == 0 && key && allZero(s, 8) && allZero(r, 6))
-		submitFrame(hidden, &c, frame);
+	if (hidden->submit && !hidden->stopped) {
+		const char *why = !allZero(s, 8) || !allZero(r, 6) ? "log-only build failed" : probIndex < 0 ? "buffer update failed"
+			: h[0x2e] & 1 ? "segmentation is not ported yet" : frame == 0 && !key ? "first frame is not a key frame" : 0;
+		if (why) {
+			hidden->stopped = 1;
+			os_log(wexLog(), "WEXVP9 submit frame=%u: %{public}s, GPU runs stopped for this session", frame, why);
+		} else submitFrame(hidden, &c, frame, key, output, data);
+	}
 	prev->flags = (uint8_t)(key | (intra & 1) << 1 | (h[0x06] & 1) << 2);
 	prev->width = width;
 	prev->height = height;
@@ -697,7 +833,7 @@ struct Decoder {
 static void destroy(struct Decoder *self) {
 	record(0, (uint64_t)self, 0, 0, 0, 0, 0);
 	if (self->hidden.hevc) {
-		freeBuffers(&self->hidden);
+		freeBuffers(&self->hidden, 1);
 		((void (*)(void *))slot(self->hidden.hevc, 1))(self->hidden.hevc);
 	}
 	self->hidden.hevc = 0;
