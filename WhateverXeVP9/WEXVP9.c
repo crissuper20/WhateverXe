@@ -618,9 +618,8 @@ static void submitFrame(struct Hidden *hidden, const struct Commands *c, uint32_
 }
 
 // Builds one frame's commands from AppleGVA's request (layout in logRequest) and logs
-// them. Assumes default loop-filter deltas (ref 1/0/-1/-1, mode 0/0), no segmentation
-// data and reference frames of the current size: the request fields for those are not
-// mapped yet, so each frame logs that.
+// them. Assumes no segmentation data and reference frames of the current size: the
+// request fields for those are not mapped yet, so each frame logs that.
 static void buildBatch(struct Hidden *hidden, const uint8_t *req) {
 	void *hevc = hidden->hevc;
 	struct Previous *prev = &hidden->prev;
@@ -685,11 +684,16 @@ static void buildBatch(struct Hidden *hidden, const uint8_t *req) {
 	// Segment 0 (CODEC_VP9_SEG_PARAMS entry, 0x14 bytes): +0 flags (u32), +4 loop filter
 	// levels per reference (intra, last, golden, altref) and mode, +0xc the four
 	// quantizer scales.
+	// Loop filter levels as libvpx's vp9_loop_filter_frame_init and Ice Lake's VP9 decoder
+	// (0x208170) compute them: header +0x1c deltas enabled, +0x22 four reference deltas,
+	// +0x28 two mode deltas (signed). Intra uses its reference delta only.
 	uint8_t seg[8][0x14] = {{0}};
-	static const int refDelta[4] = {1, 0, -1, -1};
-	int level = h[0x1a], shift = level >> 5;
+	int level = h[0x1a], scale = 1 << (level >> 5), deltas = h[0x1c];
 	for (int r = 0; r < 4; ++r)
-		for (int m = 0; m < 2; ++m) seg[0][0x4 + r * 2 + m] = (uint8_t)(level ? clampLevel(level + refDelta[r] * (1 << shift)) : 0);
+		for (int m = 0; m < 2; ++m) {
+			int v = level + (deltas ? (int8_t)h[0x22 + r] * scale + (r ? (int8_t)h[0x28 + m] * scale : 0) : 0);
+			seg[0][0x4 + r * 2 + m] = (uint8_t)(level ? clampLevel(v) : 0);
+		}
 	uint16_t scales[4] = {
 		(uint16_t)(lossless ? 4 : vp9AcQuant[clampQ(q)]),           // luma AC
 		(uint16_t)(lossless ? 4 : vp9DcQuant[clampQ(q + dqYDc)]),   // luma DC
@@ -795,7 +799,7 @@ static void buildBatch(struct Hidden *hidden, const uint8_t *req) {
 	*addResource = appleAddResource;
 	uint32_t n = usedDwords(&cmd);
 	os_log(wexLog(), "WEXVP9 batch frame=%u key=%d size=%ux%u q=%d lf=%d status=%d/%d/%d/%d/%d/%d/%d/%d "
-		"surface/addr/ind=%d/%d/%d/%d/%d/%d addresses %u surface patches %u dwords=%u (default lf deltas, no segment data, refs at current size)", frame,
+		"surface/addr/ind=%d/%d/%d/%d/%d/%d addresses %u surface patches %u dwords=%u (no segment data, refs at current size)", frame,
 		key, width, height, q, level, s[0], s[1], s[2], s[3], s[4], s[5], s[6], s[7], r[0], r[1], r[2], r[3], r[4], r[5], placeholders, surfacePatches, n);
 	for (uint32_t at = 0; at < n; at += 16) {
 		char text[16 * 9 + 1];
