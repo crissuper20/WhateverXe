@@ -3,8 +3,9 @@
 # 0xC6E-0xD2F between the patch snippets already in that pad. The factory's skip
 # branch for subtypes it does not build (jne 0x149a5 at 0x144e2) jumps here instead.
 # Subtype 0x1000 (VP9) with an empty slot calls WEXVP9Create(context, config) from
-# @loader_path/WEXVP9.dylib. A decoder (non-NULL result) continues at the original skip
-# target. A missing library or symbol, or a NULL result, fails the request through the
+# @loader_path/WEXVP9.dylib. A decoder (non-NULL result) goes into the factory's decoder
+# slot and continues where a native decoder whose create succeeded does (0x149a8,
+# r12d = 0, as the 0x400 case at 0x148bb). A missing library or symbol, or a NULL result, fails the request through the
 # factory's own error exit (0x15072, ebx = 1), as when no advertised config matches, so
 # VideoToolbox creates no hardware VP9 session without a decoder behind it.
 # Regenerate the bytes in kern_tahoe_descriptor_policy.hpp with tools/vp9/gen-stub.py.
@@ -12,6 +13,7 @@
 	.set SKIP, 0x149a5     # original jne target
 	.set DLOPEN, 0x23e380  # __stubs: _dlopen
 	.set DLSYM, 0x23e386   # __stubs: _dlsym
+	.set NEXT, 0x149a8     # native success: next config node
 	.set FAIL, 0x15072     # error exit: releases the perf capability, frees, returns ebx
 	.text
 Lstart:
@@ -51,7 +53,12 @@ Ldone:
 	popq	%r9
 	popq	%rsi
 	testq	%rax, %rax
-	jne	Lstart + (SKIP - CAVE)
+	je	Lfail
+	movq	(%r9), %rcx            # slot array; rcx is dead here, as after a native create call
+	movq	%rax, (%rcx,%r15,8)
+	xorl	%r12d, %r12d
+	jmp	Lstart + (NEXT - CAVE)
+Lfail:
 	movl	$1, %ebx               # no decoder: fail like an unmatched config
 	jmp	Lstart + (FAIL - CAVE)
 Lpath:

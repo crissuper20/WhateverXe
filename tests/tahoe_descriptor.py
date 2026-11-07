@@ -178,12 +178,14 @@ int main(int argc,char **argv) {
  static_assert(vp9Cave+sizeof(vp9Stub)<=vp9CaveEnd,"stub fits the header-pad gap");
  {int32_t rel; memcpy(&rel,vp9Jump+2,4); assert(vp9Jump[0]==0x0f && vp9Jump[1]==0x85 && int64_t(vp9Branch)+6+rel==int64_t(vp9Cave));}
  {int32_t rel; memcpy(&rel,vp9Stub+8,4); assert(vp9Stub[6]==0x0f && vp9Stub[7]==0x85 && int64_t(vp9Cave)+12+rel==0x149a5);}  // other subtypes
- {int32_t rel; memcpy(&rel,vp9Stub+0x6d,4); assert(vp9Stub[0x6b]==0x0f && vp9Stub[0x6c]==0x85 && int64_t(vp9Cave)+0x71+rel==0x149a5);} // a decoder
- {int32_t rel; memcpy(&rel,vp9Stub+0x77,4); assert(vp9Stub[0x71]==0xbb && vp9Stub[0x72]==1 && vp9Stub[0x76]==0xe9 && int64_t(vp9Cave)+0x7b+rel==0x15072);} // ebx=1, error exit
+ {const uint8_t store[]={0x48,0x85,0xc0,0x74,0x0f,0x49,0x8b,0x09,0x4a,0x89,0x04,0xf9,0x45,0x31,0xe4}; // test; je fail; slot[r15]=rax; r12d=0
+  assert(!memcmp(vp9Stub+0x68,store,sizeof(store)) && 0x6d+0x0f==0x7c);}
+ {int32_t rel; memcpy(&rel,vp9Stub+0x78,4); assert(vp9Stub[0x77]==0xe9 && int64_t(vp9Cave)+0x7c+rel==0x149a8);}             // native success path
+ {int32_t rel; memcpy(&rel,vp9Stub+0x82,4); assert(vp9Stub[0x7c]==0xbb && vp9Stub[0x7d]==1 && vp9Stub[0x81]==0xe9 && int64_t(vp9Cave)+0x86+rel==0x15072);} // ebx=1, error exit
  {int32_t rel; memcpy(&rel,vp9Stub+0x33,4); assert(vp9Stub[0x32]==0xe8 && int64_t(vp9Cave)+0x37+rel==0x23e380);}            // _dlopen stub
  {int32_t rel; memcpy(&rel,vp9Stub+0x47,4); assert(vp9Stub[0x46]==0xe8 && int64_t(vp9Cave)+0x4b+rel==0x23e386);}            // _dlsym stub
- assert(!strcmp(reinterpret_cast<const char *>(vp9Stub+0x7b),"@loader_path/WEXVP9.dylib"));
- assert(!strcmp(reinterpret_cast<const char *>(vp9Stub+0x7b+26),"WEXVP9Create"));
+ assert(!strcmp(reinterpret_cast<const char *>(vp9Stub+0x86),"@loader_path/WEXVP9.dylib"));
+ assert(!strcmp(reinterpret_cast<const char *>(vp9Stub+0x86+26),"WEXVP9Create"));
  memset(page,0,sizeof(page));
  for(auto &part:vp9Patches) assert(!vp9Part(page,part.page,true,false,"25G332")); // Any other content is refused.
  for(auto &part:vp9Patches) assert(part.offset+part.size<=0x1000);                 // Every piece stays in its page.
@@ -191,6 +193,9 @@ int main(int argc,char **argv) {
   {
    // The error exit the stub fails through: leaq -0x1b0(%rbp),%rdx; movl $0,(%rdx) (release
    // the perf capability), then free and return ebx.
+   const uint8_t next[]={0x4d,0x8b,0x76,0x38,0x44,0x89,0xe6}; // 0x149a8: movq 0x38(%r14),%r14; movl %r12d,%esi
+   uint8_t got[sizeof(next)]; FILE *n=fopen(argv[3],"rb"); assert(n); assert(!fseek(n,0x149a8,SEEK_SET));
+   assert(fread(got,1,sizeof(got),n)==sizeof(got)); fclose(n); assert(!memcmp(got,next,sizeof(next)));
    const uint8_t exit[]={0x48,0x8d,0x95,0x50,0xfe,0xff,0xff,0xc7,0x02,0x00,0x00,0x00,0x00};
    uint8_t at[sizeof(exit)]; FILE *f=fopen(argv[3],"rb"); assert(f); assert(!fseek(f,0x15072,SEEK_SET));
    assert(fread(at,1,sizeof(at),f)==sizeof(at)); fclose(f); assert(!memcmp(at,exit,sizeof(exit)));
