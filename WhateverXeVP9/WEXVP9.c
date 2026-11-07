@@ -11,8 +11,11 @@
 // without it every request is declined.
 // With WEXVP9.batch also present, the decoder creates a hidden native HEVC decoder from
 // the same context and uses its Intel HCP/MI/VDENC command builders to build each frame's
-// VP9 commands into a plain memory buffer, which is logged and never submitted. Commands
-// that need GPU addresses (surface, buffer address, bitstream address) are not built yet.
+// VP9 commands into a plain memory buffer, which is logged and never submitted; address
+// fields get numbered placeholders.
+// With WEXVP9.submit also present, the session's first frame, when it is a key frame whose
+// log-only build succeeded, is built again into the OS command buffer with real addresses
+// and submitted to the GPU once. Later frames stay log-only.
 #include <dlfcn.h>
 #include <mach-o/dyld.h>
 #include <mach-o/loader.h>
@@ -23,6 +26,7 @@
 #include <string.h>
 #include <unistd.h>
 
+#include "vp9_probs.h"
 #include "vp9_quant.h"
 
 static os_log_t wexLog(void) {
@@ -116,7 +120,8 @@ enum {
 	HcpBsdObject = 0xe8 / 8,
 	HcpVp9PicState = 0xf8 / 8,
 	HcpVp9SegmentState = 0x108 / 8,
-	MiFlushDw = 0x48 / 8,      // MI vtable slot
+	MiFlushDw = 0x48 / 8,      // MI vtable slots
+	MiBatchBufferEnd = 0x18 / 8, // (mi, cmd, 0)
 	VdencPipelineFlush = 0x40 / 8, // VDENC vtable slot
 	HcpGetVp9BufferSize = 0x58 / 8,
 	HcpDecodeSurfaceState = 0x80 / 8,
@@ -130,6 +135,15 @@ enum {
 	OsFreeResource = 0x200,    // MOS_INTERFACE function fields (plain members, no vtable)
 	OsGetResourceInfo = 0x210,
 	HcpAddResource = 0x2a8,    // MHW interface field: AddResourceToCmd(os, cmd, params)
+	OsSetGpuContext = 0xf0,    // (os, context id), as CodechalDecode::Execute calls it
+	OsGetCommandBuffer = 0x2a8, // (os, cmd, 0)
+	OsReturnCommandBuffer = 0x2c8, // (os, cmd, 0)
+	OsSubmitCommandBuffer = 0x2d0, // (os, cmd, null rendering)
+	CodechalGpuContext = 0x1e8, // u32 GPU context id
+	SendProlog = 0x8de70,      // CodechalDecode::SendPrologWithFrameTracking(codechal, cmd, frame tracking)
+	ResLockInit = 0x6c490,     // CodechalResLock(lock, os, resource)
+	ResLockMap = 0x6c4c0,      // Lock(lock, 2 = write only): CPU pointer
+	ResLockDone = 0x6c620,     // ~CodechalResLock(lock): unlock
 	SurfaceInfoPatch = 0x1d,   // MHW_RESOURCE_PARAMS command type of Apple's surface patches
 	FormatNV12 = 0x19,         // MOS_FORMAT as the HEVC decoder and SURFACE_STATE use it
 	ResourceSize = 0x148,      // MOS_RESOURCE; MOS_SURFACE adds the details up to 0x208
@@ -263,12 +277,13 @@ static const struct {
 	{"WEXVP9CurrentMvTemporal", 13, 0x330}, {"WEXVP9Probability", -1, 0x3c8}, {"WEXVP9SegmentId", 20, 0x3d0},
 	{"WEXVP9HvdLine", 21, 0x3d8}, {"WEXVP9HvdTile", 22, 0x3e0},
 };
-enum { BufferCount = sizeof(buffers) / sizeof(buffers[0]), MvTemporal = 6 };
+enum { BufferCount = sizeof(buffers) / sizeof(buffers[0]), MvTemporal = 6, Probability = 7 };
 
 struct Hidden {
 	void *hevc;
 	void *context;
 	uint32_t frame;
+	int submit, submitted; // WEXVP9.submit present; the one GPU run was tried
 	struct Previous prev;
 	uint32_t bufferWidth, bufferHeight; // frame size the buffers were allocated for
 	uint8_t allocated[BufferCount];
@@ -318,7 +333,7 @@ static int allocateBuffers(struct Hidden *hidden, uint32_t width, uint32_t heigh
 			memcpy(&size, sizeParams + 0x10, 4);
 		}
 		int alloc = status ? -1 : ((int (*)(void *, void *, uint32_t, const char *, int, int))(vaBase + AllocateBuffer))(
-			codechal, hidden->resource[i], size, buffers[i].name, 0, 0);
+			codechal, hidden->resource[i], size, buffers[i].name, 1, 0); // zero filled
 		os_log(wexLog(), "WEXVP9 batch: buffer %{public}s type %d size 0x%x size status %d alloc status %d", buffers[i].name,
 			buffers[i].type, size, status, alloc);
 		if (status || alloc) ok = 0;
@@ -401,6 +416,91 @@ static int placeholderAddress(void *os, void *cmd, uint8_t *params) {
 	placeAddress(at, shift, low);
 	if (upper) placeAddress(at + upper, shift, low + *(uint32_t *)(params + 0x28));
 	return 0;
+}
+
+// One frame's command parameters, built once and emitted into either buffer.
+struct Commands {
+	void *hcp, *mi, *vdenc;
+	void *vdInit, *pms, *pba, *ind, *segState, *picState, *bsd, *vdFlush, *pipeFlush, *flushDw;
+	uint8_t (*surfaceParams)[0x40];
+	int surfaces, sv[4], buffersOk, streamOk;
+};
+
+// Emits the frame's commands; s gets the builders' statuses, r the address commands'
+// (-1 when skipped).
+static void emit(const struct Commands *c, void *cmd, int s[8], int r[6]) {
+	for (int i = 0; i < 6; ++i) r[i] = 0;
+	s[0] = ((Call3)(vaBase + VdControlState))(c->mi, cmd, c->vdInit);
+	s[1] = ((Call3)slot(c->hcp, HcpPipeModeSelect))(c->hcp, cmd, c->pms);
+	for (int i = 0; i < c->surfaces; ++i)
+		r[i] = c->sv[i] ? -1 : ((Call3)slot(c->hcp, HcpDecodeSurfaceState))(c->hcp, cmd, c->surfaceParams[i]);
+	r[4] = c->sv[0] || !c->buffersOk ? -1 : ((Call3)slot(c->hcp, HcpPipeBufAddr))(c->hcp, cmd, c->pba);
+	r[5] = !c->streamOk ? -1 : ((Call3)slot(c->hcp, HcpIndObjBaseAddr))(c->hcp, cmd, c->ind);
+	s[2] = ((Call4)slot(c->hcp, HcpVp9SegmentState))(c->hcp, cmd, 0, c->segState);
+	s[3] = ((Call4)slot(c->hcp, HcpVp9PicState))(c->hcp, cmd, 0, c->picState);
+	s[4] = ((Call3)slot(c->hcp, HcpBsdObject))(c->hcp, cmd, c->bsd);
+	s[5] = ((Call3)(vaBase + VdControlState))(c->mi, cmd, c->vdFlush);
+	s[6] = ((Call3)slot(c->vdenc, VdencPipelineFlush))(c->vdenc, cmd, c->pipeFlush);
+	s[7] = ((Call3)slot(c->mi, MiFlushDw))(c->mi, cmd, c->flushDw);
+}
+
+static int allZero(const int *v, int count) {
+	for (int i = 0; i < count; ++i)
+		if (v[i]) return 0;
+	return 1;
+}
+
+// The single GPU run, in the order Apple's HEVC decode uses: key-frame probabilities
+// into the probability buffer, set the GPU context, get the command buffer, prolog with
+// frame tracking, the frame's commands, MI_BATCH_BUFFER_END, return, submit. A builder
+// failing here rewinds the buffer to just after the prolog, so only the prolog and the
+// batch end run.
+static void submitFrame(struct Hidden *hidden, const struct Commands *c, uint32_t frame) {
+	hidden->submitted = 1;
+	const uint8_t *data;
+	memcpy(&data, (const uint8_t *)hidden->context + 0x90, 8);
+	if (!data || data[1] != 0x49 || data[2] != 0x83 || data[3] != 0x42) {
+		os_log(wexLog(), "WEXVP9 submit frame=%u: bitstream does not start with a key frame sync code (%02x %02x %02x %02x), "
+			"not submitted", frame, data ? data[0] : 0, data ? data[1] : 0, data ? data[2] : 0, data ? data[3] : 0);
+		return;
+	}
+	void *codechal = *(void **)((uint8_t *)hidden->hevc + HevcCodechal);
+	void *os = osInterface(hidden->hevc);
+	uint8_t lock[0x40] = {0};
+	((void (*)(void *, void *, void *))(vaBase + ResLockInit))(lock, os, hidden->resource[Probability]);
+	uint8_t *probs = ((uint8_t *(*)(void *, int))(vaBase + ResLockMap))(lock, 2);
+	if (probs) memcpy(probs, vp9KeyProbs, sizeof(vp9KeyProbs));
+	((void (*)(void *))(vaBase + ResLockDone))(lock);
+	if (!probs) {
+		os_log(wexLog(), "WEXVP9 submit frame=%u: probability buffer lock failed, not submitted", frame);
+		return;
+	}
+	uint32_t gpuContext;
+	memcpy(&gpuContext, (uint8_t *)codechal + CodechalGpuContext, 4);
+	int context = ((int (*)(void *, uint32_t))field(os, OsSetGpuContext))(os, gpuContext);
+	static uint8_t cmd[0x400];
+	memset(cmd, 0, sizeof(cmd));
+	int get = context ? -1 : ((int (*)(void *, void *, int))field(os, OsGetCommandBuffer))(os, cmd, 0);
+	if (context || get) {
+		os_log(wexLog(), "WEXVP9 submit frame=%u: set GPU context %u status %d, get command buffer %d, not submitted", frame,
+			gpuContext, context, get);
+		return;
+	}
+	int prolog = ((int (*)(void *, void *, int))(vaBase + SendProlog))(codechal, cmd, 1);
+	uint8_t afterProlog[0x10];
+	memcpy(afterProlog, cmd + 0x150, sizeof(afterProlog)); // write pointer, offset, remaining
+	int st[8], r[6];
+	emit(c, cmd, st, r);
+	int built = !prolog && allZero(st, 8) && allZero(r, c->surfaces) && !r[4] && !r[5];
+	if (!built) memcpy(cmd + 0x150, afterProlog, sizeof(afterProlog));
+	int end = ((Call3)slot(c->mi, MiBatchBufferEnd))(c->mi, cmd, 0);
+	uint32_t used;
+	memcpy(&used, cmd + 0x158, 4);
+	((int (*)(void *, void *, int))field(os, OsReturnCommandBuffer))(os, cmd, 0);
+	int submit = ((int (*)(void *, void *, int))field(os, OsSubmitCommandBuffer))(os, cmd, 0);
+	os_log(wexLog(), "WEXVP9 submit frame=%u: context %u prolog %d status=%d/%d/%d/%d/%d/%d/%d/%d surface/addr/ind=%d/%d/%d "
+		"%{public}s end %d bytes %u submit %d", frame, gpuContext, prolog, st[0], st[1], st[2], st[3], st[4], st[5], st[6], st[7],
+		r[0], r[4], r[5], built ? "frame built" : "BUILD FAILED, prolog only", end, used, submit);
 }
 
 // Builds one frame's commands from AppleGVA's request (layout in logRequest) and logs
@@ -558,19 +658,10 @@ static void buildBatch(struct Hidden *hidden, const uint8_t *req) {
 	void *appleAddResource = *addResource;
 	*addResource = (void *)placeholderAddress;
 	placeholders = surfacePatches = 0;
-	int s[8], r[6] = {0, 0, 0, 0, 0, 0};
-	s[0] = ((Call3)(vaBase + VdControlState))(mi, &cmd, vdInit);
-	s[1] = ((Call3)slot(hcp, HcpPipeModeSelect))(hcp, &cmd, pms);
-	for (int i = 0; i < (inter ? 4 : 1); ++i)
-		r[i] = sv[i] ? -1 : ((Call3)slot(hcp, HcpDecodeSurfaceState))(hcp, &cmd, surfaceParams[i]);
-	r[4] = sv[0] || !buffersOk ? -1 : ((Call3)slot(hcp, HcpPipeBufAddr))(hcp, &cmd, pba);
-	r[5] = streamSize < bytes ? -1 : ((Call3)slot(hcp, HcpIndObjBaseAddr))(hcp, &cmd, ind);
-	s[2] = ((Call4)slot(hcp, HcpVp9SegmentState))(hcp, &cmd, 0, segState);
-	s[3] = ((Call4)slot(hcp, HcpVp9PicState))(hcp, &cmd, 0, picState);
-	s[4] = ((Call3)slot(hcp, HcpBsdObject))(hcp, &cmd, bsd);
-	s[5] = ((Call3)(vaBase + VdControlState))(mi, &cmd, vdFlush);
-	s[6] = ((Call3)slot(vdenc, VdencPipelineFlush))(vdenc, &cmd, &pipeFlush);
-	s[7] = ((Call3)slot(mi, MiFlushDw))(mi, &cmd, flushDw);
+	struct Commands c = {hcp, mi, vdenc, vdInit, pms, pba, ind, segState, picState, bsd, vdFlush, &pipeFlush, flushDw,
+		surfaceParams, inter ? 4 : 1, {sv[0], sv[1], sv[2], sv[3]}, buffersOk, streamSize >= bytes};
+	int s[8], r[6];
+	emit(&c, &cmd, s, r);
 	*addResource = appleAddResource;
 	uint32_t n = usedDwords(&cmd);
 	os_log(wexLog(), "WEXVP9 batch frame=%u key=%d size=%ux%u q=%d lf=%d status=%d/%d/%d/%d/%d/%d/%d/%d "
@@ -583,6 +674,8 @@ static void buildBatch(struct Hidden *hidden, const uint8_t *req) {
 		text[9 * count - 1] = 0;
 		os_log(wexLog(), "WEXVP9 batch frame=%u +%03x: %{public}s", frame, at, text);
 	}
+	if (hidden->submit && !hidden->submitted && frame == 0 && key && allZero(s, 8) && allZero(r, 6))
+		submitFrame(hidden, &c, frame);
 	prev->flags = (uint8_t)(key | (intra & 1) << 1 | (h[0x06] & 1) << 2);
 	prev->width = width;
 	prev->height = height;
@@ -690,6 +783,8 @@ __attribute__((visibility("default"))) void *WEXVP9Create(void *context, void *c
 	if (markerExists("WEXVP9.batch")) {
 		self->hidden.hevc = createHevc(context, node);
 		self->hidden.context = context;
+		self->hidden.submit = markerExists("WEXVP9.submit");
+		os_log(wexLog(), "WEXVP9 batch: GPU run of the first key frame %{public}s", self->hidden.submit ? "ON (WEXVP9.submit)" : "off");
 	}
 	return self;
 }
