@@ -15,7 +15,7 @@
 // fields get numbered placeholders.
 // With WEXVP9.submit also present, every frame whose log-only build succeeded is built
 // again into the OS command buffer with real addresses, submitted to the GPU and waited
-// for. The first failure (or a frame the port does not handle yet, such as segmentation)
+// for. The first failure (or a first frame that is not a key frame)
 // stops GPU runs for the session; later frames stay log-only.
 #include <dlfcn.h>
 #include <mach-o/dyld.h>
@@ -92,10 +92,10 @@ static int logRequest(uint64_t entry) {
 	memcpy(slots, request + 0xa520, sizeof(slots));
 	for (int i = 0; i < 8; ++i) memcpy(&refs[i], request + 0x1260 + i * 0x1258 + 0x1250, 8);
 	os_log(wexLog(), "WEXVP9 request %llx bytes=%u uncomp=%u header_size=%u type=%u show=%u er=%u intra=%u refresh=%02x "
-		"reset=%u bias=%u%u%u hp=%u interp=%u refresh_ctx=%u parallel=%u ctx=%u lf=%u sharp=%u q=%u dq=%d/%d/%d seg=%u "
+		"reset=%u bias=%u%u%u hp=%u interp=%u refresh_ctx=%u parallel=%u ctx=%u lf=%u sharp=%u q=%u dq ydc/uvdc/uvac=%d/%d/%d seg=%u map=%u temporal=%u abs=%u "
 		"log2=%u/%u profile=%u depth=%u size=%ux%u", at, bytes, request[0x1248], headerSize, h[0x05], h[0x06], h[0x07],
 		h[0x08], h[0x04], h[0x0d], h[0x12], h[0x13], h[0x14], h[0x15], h[0x16], h[0x17], h[0x18], h[0x19], h[0x1a], h[0x1b],
-		h[0x2a], (int8_t)h[0x2b], (int8_t)h[0x2d], (int8_t)h[0x2c], h[0x2e], h[0x40], h[0x44], h[0x48], h[0x49], width, height);
+		h[0x2a], (int8_t)h[0x2b], (int8_t)h[0x2c], (int8_t)h[0x2d], h[0x2e], h[0x2f], h[0x37], h[0x3c], h[0x40], h[0x44], h[0x48], h[0x49], width, height);
 	os_log(wexLog(), "WEXVP9 request %llx output=%llx refs=%llx %llx %llx %llx %llx %llx %llx %llx slots=%u/%u/%u", at, output,
 		refs[0], refs[1], refs[2], refs[3], refs[4], refs[5], refs[6], refs[7], slots[0], slots[1], slots[2]);
 	peek(5, "request", at);
@@ -301,6 +301,7 @@ struct Hidden {
 	uint32_t size[BufferCount];
 	// Probability buffer bookkeeping, as iHD's DetermineInternalBufferUpdate.
 	uint8_t pendingFull[4], pendingPartial, interSaved, currentMv;
+	uint8_t pendingSegProbs[4], segProbs[10]; // tree (7) and prediction (3) probabilities to copy
 	uint8_t interProbs[Vp9SegProbOffset - Vp9InterProbOffset];
 	uint8_t resource[BufferCount][ResourceSize];
 };
@@ -462,16 +463,27 @@ static int placeholderAddress(void *os, void *cmd, uint8_t *params) {
 
 // Per-frame buffer state, ported from Intel media-driver's DetermineInternalBufferUpdate,
 // ProbBufferPartialUpdatewithDrv and the MV buffer rotation (MIT, LICENSE-media-driver),
-// without segmentation (such frames are not submitted). Picks the probability buffer of
-// this frame (context 0 for key, intra-only and error-resilient frames), resets or
-// restores its contents as iHD does, zeroes the segment id buffer when iHD does and
-// rotates the motion vector buffers for inter frames. Returns the frame context index,
-// -1 when a buffer could not be locked.
-static int updateBuffers(struct Hidden *hd, int key, int intra, int errorRes, int resetCtx, int ctx, int scaling) {
+// Picks the probability buffer of this frame (context 0 for key, intra-only and
+// error-resilient frames), resets or restores its contents as iHD does, copies the
+// segmentation tree and prediction probabilities (segProbs, 7 + 3) into it when the map
+// is updated, and into other buffers later when they are next used with segmentation,
+// zeroes the segment id buffer when iHD does and rotates the motion vector buffers for
+// inter frames. Returns the frame context index, -1 when a buffer could not be locked.
+static int updateBuffers(struct Hidden *hd, int key, int intra, int errorRes, int resetCtx, int ctx, int scaling,
+	int segEnabled, int segUpdateMap, const uint8_t *segProbs) {
 	int resetAll = key || errorRes || (resetCtx == 3 && intra);
 	int resetSpecified = resetCtx == 2 && intra;
 	int index = key || intra || errorRes ? 0 : ctx;
-	int full = 0, partial = 0, save = 0, restore = 0;
+	int full = 0, partial = 0, save = 0, restore = 0, copySeg = 0;
+	if (segEnabled && segUpdateMap) {
+		copySeg = 1;
+		for (int i = 0; i < 4; ++i) hd->pendingSegProbs[i] = (uint8_t)(i != index);
+		memcpy(hd->segProbs, segProbs, 7);         // tree, header +0x30
+		memcpy(hd->segProbs + 7, segProbs + 8, 3); // prediction, header +0x38 (+0x37 is temporal update)
+	} else if (segEnabled && hd->pendingSegProbs[index]) {
+		copySeg = 1;
+		hd->pendingSegProbs[index] = 0;
+	}
 	if (resetAll) {
 		full = 1;
 		hd->pendingPartial = (uint8_t)(key || intra);
@@ -498,12 +510,13 @@ static int updateBuffers(struct Hidden *hd, int key, int intra, int errorRes, in
 		hd->interSaved = 0;
 	}
 	int ok = 1;
-	if (full || partial || save || restore) {
+	if (full || partial || save || restore || copySeg) {
 		uint8_t lock[0x40];
 		uint8_t *data = mapBuffer(hd, Probability0 + index, lock);
 		const uint8_t *defaults = key || intra ? vp9KeyProbs : vp9InterProbs;
 		if (!data) ok = 0;
 		else {
+			if (copySeg) memcpy(data + Vp9SegProbOffset, hd->segProbs, sizeof(hd->segProbs));
 			if (save) memcpy(hd->interProbs, data + Vp9InterProbOffset, sizeof(hd->interProbs));
 			if (full) {
 				memcpy(data, defaults, Vp9SegProbOffset);
@@ -526,8 +539,8 @@ static int updateBuffers(struct Hidden *hd, int key, int intra, int errorRes, in
 		unmapBuffer(lock);
 	}
 	if (!key && !intra) hd->currentMv ^= 1;
-	os_log(wexLog(), "WEXVP9 batch: probability context %d full %d partial %d save %d restore %d, current mv %u", index, full,
-		partial, save, restore, hd->currentMv);
+	os_log(wexLog(), "WEXVP9 batch: probability context %d full %d partial %d save %d restore %d seg probs %d, current mv %u",
+		index, full, partial, save, restore, copySeg, hd->currentMv);
 	return ok ? index : -1;
 }
 
@@ -537,6 +550,7 @@ struct Commands {
 	void *vdInit, *pms, *pba, *ind, *segState, *picState, *bsd, *vdFlush, *pipeFlush, *flushDw;
 	uint8_t (*surfaceParams)[0x40];
 	int surfaces, sv[4], buffersOk, streamOk;
+	int segments; // HCP_VP9_SEGMENT_STATE commands: 8 with segmentation, else 1
 };
 
 // Emits the frame's commands; s gets the builders' statuses, r the address commands'
@@ -549,7 +563,11 @@ static void emit(const struct Commands *c, void *cmd, int s[8], int r[6]) {
 		r[i] = c->sv[i] ? -1 : ((Call3)slot(c->hcp, HcpDecodeSurfaceState))(c->hcp, cmd, c->surfaceParams[i]);
 	r[4] = c->sv[0] || !c->buffersOk ? -1 : ((Call3)slot(c->hcp, HcpPipeBufAddr))(c->hcp, cmd, c->pba);
 	r[5] = !c->streamOk ? -1 : ((Call3)slot(c->hcp, HcpIndObjBaseAddr))(c->hcp, cmd, c->ind);
-	s[2] = ((Call4)slot(c->hcp, HcpVp9SegmentState))(c->hcp, cmd, 0, c->segState);
+	s[2] = 0;
+	for (int i = 0; i < c->segments && !s[2]; ++i) {
+		((uint8_t *)c->segState)[0x18] = (uint8_t)i; // current segment id
+		s[2] = ((Call4)slot(c->hcp, HcpVp9SegmentState))(c->hcp, cmd, 0, c->segState);
+	}
 	s[3] = ((Call4)slot(c->hcp, HcpVp9PicState))(c->hcp, cmd, 0, c->picState);
 	s[4] = ((Call3)slot(c->hcp, HcpBsdObject))(c->hcp, cmd, c->bsd);
 	s[5] = ((Call3)(vaBase + VdControlState))(c->mi, cmd, c->vdFlush);
@@ -618,8 +636,8 @@ static void submitFrame(struct Hidden *hidden, const struct Commands *c, uint32_
 }
 
 // Builds one frame's commands from AppleGVA's request (layout in logRequest) and logs
-// them. Assumes no segmentation data and reference frames of the current size: the
-// request fields for those are not mapped yet, so each frame logs that.
+// them. Assumes reference frames of the current size: the request fields for scaled
+// references are not mapped yet, so each frame logs that.
 static void buildBatch(struct Hidden *hidden, const uint8_t *req) {
 	void *hevc = hidden->hevc;
 	struct Previous *prev = &hidden->prev;
@@ -638,7 +656,9 @@ static void buildBatch(struct Hidden *hidden, const uint8_t *req) {
 	memcpy(slots, req + 0xa520, sizeof(slots));
 	uint8_t uncomp = req[0x1248];
 	int key = h[0x05] == 0, intra = h[0x08], q = h[0x2a];
-	int dqYDc = (int8_t)h[0x2b], dqUvDc = (int8_t)h[0x2d], dqUvAc = (int8_t)h[0x2c];
+	// Delta q order as Ice Lake's VP9 decoder reads it (0x208380): y dc, uv dc, uv ac.
+	int dqYDc = (int8_t)h[0x2b], dqUvDc = (int8_t)h[0x2c], dqUvAc = (int8_t)h[0x2d];
+	int segEnabled = h[0x2e] & 1;
 	int lossless = q == 0 && !dqYDc && !dqUvDc && !dqUvAc;
 
 	// CODEC_VP9_PIC_PARAMS.
@@ -650,7 +670,7 @@ static void buildBatch(struct Hidden *hidden, const uint8_t *req) {
 		| (uint32_t)(intra & 1) << 3 | (slots[0] & 7) << 4 | (uint32_t)(h[0x12] & 1) << 7 | (slots[1] & 7) << 8
 		| (uint32_t)(h[0x13] & 1) << 11 | (slots[2] & 7) << 12 | (uint32_t)(h[0x14] & 1) << 15
 		| (uint32_t)(h[0x15] & 1) << 16 | (uint32_t)(h[0x16] & 7) << 17 | (uint32_t)(h[0x18] & 1) << 20
-		| (uint32_t)(h[0x2e] & 1) << 21 | (uint32_t)(h[0x0d] & 3) << 24 | (uint32_t)(h[0x17] & 1) << 26
+		| (uint32_t)segEnabled << 21 | (uint32_t)(h[0x37] & 1) << 22 | (uint32_t)(h[0x2f] & 1) << 23 | (uint32_t)(h[0x0d] & 3) << 24 | (uint32_t)(h[0x17] & 1) << 26
 		| (uint32_t)(h[0x19] & 3) << 27 | (uint32_t)lossless << 29;
 	*(uint32_t *)(pic + 0x4) = flags;
 	for (int i = 0; i < 8; ++i) pic[0x8 + 12 * i] = (uint8_t)i; // RefFrameList[i].FrameIdx
@@ -660,6 +680,8 @@ static void buildBatch(struct Hidden *hidden, const uint8_t *req) {
 	pic[0x77] = h[0x40];                                          // log2 tile columns
 	pic[0x78] = uncomp;
 	*(uint16_t *)(pic + 0x7a) = headerSize;
+	memcpy(pic + 0x7c, h + 0x30, 7);                              // segmentation tree probabilities
+	memcpy(pic + 0x83, h + 0x38, 3);                              // segmentation prediction probabilities
 	pic[0x90] = h[0x48];
 	pic[0x91] = (uint8_t)(h[0x49] - 8);
 	pic[0x92] = 1; // 4:2:0
@@ -681,26 +703,41 @@ static void buildBatch(struct Hidden *hidden, const uint8_t *req) {
 	memcpy(picState + 0x14, &prev->width, 4);
 	memcpy(picState + 0x18, &prev->height, 4);
 
-	// Segment 0 (CODEC_VP9_SEG_PARAMS entry, 0x14 bytes): +0 flags (u32), +4 loop filter
-	// levels per reference (intra, last, golden, altref) and mode, +0xc the four
-	// quantizer scales.
-	// Loop filter levels as libvpx's vp9_loop_filter_frame_init and Ice Lake's VP9 decoder
-	// (0x208170) compute them: header +0x1c deltas enabled, +0x22 four reference deltas,
+	// CODEC_VP9_SEG_PARAMS, one 0x14-byte entry per segment: +0 flags (bit 0 reference
+	// enabled, bits 1-2 reference, bit 3 skip), +4 loop filter levels per reference (intra,
+	// last, golden, altref) and mode, +0xc luma AC/DC and chroma AC/DC quantizer scales.
+	// Header features per segment s, as Ice Lake's VP9 decoder reads them (0x208380): enabled
+	// flags at +0xad+4s (alt q, alt lf, reference, skip), signed 16-bit data at +0xce+8s (alt
+	// q, alt lf, reference); +0x3c absolute values instead of deltas.
+	// Quantizer index and loop filter levels as libvpx computes them (vp9_get_qindex,
+	// vp9_loop_filter_frame_init): header +0x1c deltas enabled, +0x22 four reference deltas,
 	// +0x28 two mode deltas (signed). Intra uses its reference delta only.
 	uint8_t seg[8][0x14] = {{0}};
-	int level = h[0x1a], scale = 1 << (level >> 5), deltas = h[0x1c];
-	for (int r = 0; r < 4; ++r)
-		for (int m = 0; m < 2; ++m) {
-			int v = level + (deltas ? (int8_t)h[0x22 + r] * scale + (r ? (int8_t)h[0x28 + m] * scale : 0) : 0);
-			seg[0][0x4 + r * 2 + m] = (uint8_t)(level ? clampLevel(v) : 0);
-		}
-	uint16_t scales[4] = {
-		(uint16_t)(lossless ? 4 : vp9AcQuant[clampQ(q)]),           // luma AC
-		(uint16_t)(lossless ? 4 : vp9DcQuant[clampQ(q + dqYDc)]),   // luma DC
-		(uint16_t)(lossless ? 4 : vp9AcQuant[clampQ(q + dqUvAc)]),  // chroma AC
-		(uint16_t)(lossless ? 4 : vp9DcQuant[clampQ(q + dqUvDc)]),  // chroma DC
-	};
-	memcpy(seg[0] + 0xc, scales, sizeof(scales));
+	int level = h[0x1a], deltas = h[0x1c], absolute = h[0x3c];
+	for (int id = 0; id < 8; ++id) {
+		const uint8_t *on = h + 0xad + 4 * id;
+		int16_t data[3];
+		memcpy(data, h + 0xce + 8 * id, sizeof(data));
+		int segQ = segEnabled && on[0] ? clampQ(absolute ? data[0] : q + data[0]) : q;
+		int segLevel = segEnabled && on[1] ? clampLevel(absolute ? data[1] : level + data[1]) : level;
+		int scale = 1 << (segLevel >> 5);
+		for (int r = 0; r < 4; ++r)
+			for (int m = 0; m < 2; ++m) {
+				int v = segLevel + (deltas ? (int8_t)h[0x22 + r] * scale + (r ? (int8_t)h[0x28 + m] * scale : 0) : 0);
+				seg[id][0x4 + r * 2 + m] = (uint8_t)(level ? clampLevel(v) : 0);
+			}
+		// iHD: a reference feature on a key or intra-only frame means intra.
+		int refOn = segEnabled && on[2], reference = refOn && !key && !intra ? data[2] & 3 : 0;
+		uint16_t segFlags = (uint16_t)(refOn | reference << 1 | (segEnabled && on[3]) << 3);
+		uint16_t scales[4] = {
+			(uint16_t)vp9AcQuant[segQ],                  // luma AC
+			(uint16_t)vp9DcQuant[clampQ(segQ + dqYDc)],  // luma DC
+			(uint16_t)vp9AcQuant[clampQ(segQ + dqUvAc)], // chroma AC
+			(uint16_t)vp9DcQuant[clampQ(segQ + dqUvDc)], // chroma DC
+		};
+		memcpy(seg[id], &segFlags, 2);
+		memcpy(seg[id] + 0xc, scales, sizeof(scales));
+	}
 	// MHW_VDBOX_VP9_SEGMENT_STATE: +0x8 decode segment data, +0x18 segment id.
 	uint8_t segState[0x20] = {0};
 	*(void **)(segState + 0x8) = seg;
@@ -773,7 +810,8 @@ static void buildBatch(struct Hidden *hidden, const uint8_t *req) {
 	for (int i = 0; i < BufferCount; ++i)
 		if (hidden->allocated[i] && buffers[i].field) *(void **)((uint8_t *)pba + buffers[i].field) = hidden->resource[i];
 	int scaling = prev->width != width || prev->height != height;
-	int probIndex = buffersOk ? updateBuffers(hidden, key, intra, h[0x07] & 1, h[0x0d] & 3, h[0x19] & 3, scaling) : -1;
+	int probIndex = buffersOk ? updateBuffers(hidden, key, intra, h[0x07] & 1, h[0x0d] & 3, h[0x19] & 3, scaling, segEnabled,
+		h[0x2f] & 1, h + 0x30) : -1;
 	if (probIndex >= 0) *(void **)((uint8_t *)pba + PbaProbability) = hidden->resource[Probability0 + probIndex];
 	if (inter) { // iHD: current MV buffer for inter frames, the previous one when that frame was inter too
 		*(void **)((uint8_t *)pba + PbaCurrentMv) = hidden->resource[MvTemporal0 + hidden->currentMv];
@@ -793,14 +831,15 @@ static void buildBatch(struct Hidden *hidden, const uint8_t *req) {
 	*addResource = (void *)placeholderAddress;
 	placeholders = surfacePatches = 0;
 	struct Commands c = {hcp, mi, vdenc, vdInit, pms, pba, ind, segState, picState, bsd, vdFlush, &pipeFlush, flushDw,
-		surfaceParams, inter ? 4 : 1, {sv[0], sv[1], sv[2], sv[3]}, buffersOk, streamOk};
+		surfaceParams, inter ? 4 : 1, {sv[0], sv[1], sv[2], sv[3]}, buffersOk, streamOk, segEnabled ? 8 : 1};
 	int s[8], r[6];
 	emit(&c, &cmd, s, r);
 	*addResource = appleAddResource;
 	uint32_t n = usedDwords(&cmd);
 	os_log(wexLog(), "WEXVP9 batch frame=%u key=%d size=%ux%u q=%d lf=%d status=%d/%d/%d/%d/%d/%d/%d/%d "
-		"surface/addr/ind=%d/%d/%d/%d/%d/%d addresses %u surface patches %u dwords=%u (no segment data, refs at current size)", frame,
-		key, width, height, q, level, s[0], s[1], s[2], s[3], s[4], s[5], s[6], s[7], r[0], r[1], r[2], r[3], r[4], r[5], placeholders, surfacePatches, n);
+		"surface/addr/ind=%d/%d/%d/%d/%d/%d addresses %u surface patches %u dwords=%u seg=%d map=%d temporal=%d abs=%d (refs at current size)", frame,
+		key, width, height, q, level, s[0], s[1], s[2], s[3], s[4], s[5], s[6], s[7], r[0], r[1], r[2], r[3], r[4], r[5], placeholders, surfacePatches, n,
+		segEnabled, h[0x2f] & 1, h[0x37] & 1, absolute);
 	for (uint32_t at = 0; at < n; at += 16) {
 		char text[16 * 9 + 1];
 		uint32_t count = n - at < 16 ? n - at : 16;
@@ -810,7 +849,7 @@ static void buildBatch(struct Hidden *hidden, const uint8_t *req) {
 	}
 	if (hidden->submit && !hidden->stopped) {
 		const char *why = !allZero(s, 8) || !allZero(r, 6) ? "log-only build failed" : probIndex < 0 ? "buffer update failed"
-			: h[0x2e] & 1 ? "segmentation is not ported yet" : frame == 0 && !key ? "first frame is not a key frame" : 0;
+			: frame == 0 && !key ? "first frame is not a key frame" : 0;
 		if (why) {
 			hidden->stopped = 1;
 			os_log(wexLog(), "WEXVP9 submit frame=%u: %{public}s, GPU runs stopped for this session", frame, why);
