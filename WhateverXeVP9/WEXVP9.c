@@ -296,6 +296,7 @@ struct Hidden {
 	uint32_t frame;
 	int submit, stopped; // WEXVP9.submit present; GPU runs stopped for this session
 	struct Previous prev;
+	uint32_t slotWidth[8], slotHeight[8]; // picture size held by each reference slot
 	uint32_t bufferWidth, bufferHeight; // frame size the buffers were allocated for
 	uint8_t allocated[BufferCount];
 	uint32_t size[BufferCount];
@@ -636,8 +637,7 @@ static void submitFrame(struct Hidden *hidden, const struct Commands *c, uint32_
 }
 
 // Builds one frame's commands from AppleGVA's request (layout in logRequest) and logs
-// them. Assumes reference frames of the current size: the request fields for scaled
-// references are not mapped yet, so each frame logs that.
+// them. Reference sizes are tracked per slot from refresh_frame_flags.
 static void buildBatch(struct Hidden *hidden, const uint8_t *req) {
 	void *hevc = hidden->hevc;
 	struct Previous *prev = &hidden->prev;
@@ -691,8 +691,8 @@ static void buildBatch(struct Hidden *hidden, const uint8_t *req) {
 	static uint8_t refList[8][RefListSize];
 	void *refs[8];
 	for (int i = 0; i < 8; ++i) {
-		memcpy(refList[i] + 0x1248, &width, 4);
-		memcpy(refList[i] + 0x124c, &height, 4);
+		memcpy(refList[i] + 0x1248, hidden->slotWidth[i] ? &hidden->slotWidth[i] : &width, 4);
+		memcpy(refList[i] + 0x124c, hidden->slotHeight[i] ? &hidden->slotHeight[i] : &height, 4);
 		refs[i] = refList[i];
 	}
 	// MHW_VDBOX_VP9_PIC_STATE.
@@ -837,7 +837,7 @@ static void buildBatch(struct Hidden *hidden, const uint8_t *req) {
 	*addResource = appleAddResource;
 	uint32_t n = usedDwords(&cmd);
 	os_log(wexLog(), "WEXVP9 batch frame=%u key=%d size=%ux%u q=%d lf=%d status=%d/%d/%d/%d/%d/%d/%d/%d "
-		"surface/addr/ind=%d/%d/%d/%d/%d/%d addresses %u surface patches %u dwords=%u seg=%d map=%d temporal=%d abs=%d (refs at current size)", frame,
+		"surface/addr/ind=%d/%d/%d/%d/%d/%d addresses %u surface patches %u dwords=%u seg=%d map=%d temporal=%d abs=%d (refs at slot sizes)", frame,
 		key, width, height, q, level, s[0], s[1], s[2], s[3], s[4], s[5], s[6], s[7], r[0], r[1], r[2], r[3], r[4], r[5], placeholders, surfacePatches, n,
 		segEnabled, h[0x2f] & 1, h[0x37] & 1, absolute);
 	for (uint32_t at = 0; at < n; at += 16) {
@@ -858,6 +858,11 @@ static void buildBatch(struct Hidden *hidden, const uint8_t *req) {
 	prev->flags = (uint8_t)(key | (intra & 1) << 1 | (h[0x06] & 1) << 2);
 	prev->width = width;
 	prev->height = height;
+	for (int i = 0; i < 8; ++i)
+		if (key || (h[0x04] >> i & 1)) {
+			hidden->slotWidth[i] = width;
+			hidden->slotHeight[i] = height;
+		}
 }
 
 // Same layout as the driver's root decoder base (ctor 0x21756): three pointers, 32
