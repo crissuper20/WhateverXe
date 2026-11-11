@@ -155,8 +155,12 @@ extern "C" __attribute__((naked,used)) void tglTahoeMatrixBridge() {
 // render engine. For STENCIL_BUFFER only, take the kext's own uncompressed branch
 // at 52de0, which resolves CCS first if the resource is dirty.
 extern "C" {
-uintptr_t tglStencilPlain, tglStencilCompress;
+uintptr_t tglStencilPlain, tglStencilCompress, tglStencilSkip;
 }
+// A D32S8 stencil shares its ResourceInfoEntry with the depth. The plain branch
+// resolves the entry and clears its compression flag (0x91 bit 1), so depth
+// programmed as compressed in the same batch was later sampled as uncompressed.
+// A stencil packet now skips both and leaves the entry to the depth.
 extern "C" __attribute__((naked,used)) void tglStencilCompressBridge() {
  asm volatile(
   "movq 0x10(%rbp), %rcx\n"
@@ -164,9 +168,10 @@ extern "C" __attribute__((naked,used)) void tglStencilCompressBridge() {
   "je 1f\n"
   "movq -0xa0(%rbp), %rax\n"
   "cmpl $0x78060006, (%r15,%rax,4)\n"
-  "je 1f\n"
+  "je 2f\n"
   "jmpq *_tglStencilCompress(%rip)\n"
-  "1: jmpq *_tglStencilPlain(%rip)\n");
+  "1: jmpq *_tglStencilPlain(%rip)\n"
+  "2: jmpq *_tglStencilSkip(%rip)\n");
 }
 static bool tglSonomaSurfaceFramebufferReady=true;
 static bool tglInstallSonomaSurfaceABI(KernelPatcher &patcher,size_t index,mach_vm_address_t address,size_t size,bool framebuffer) {
@@ -11417,7 +11422,7 @@ bool XE::processTGLAccelerator(KernelPatcher &patcher, size_t index, mach_vm_add
 				!memcmp(reinterpret_cast<void *>(address+0x52D97),stencilCompress,sizeof(stencilCompress));
 			patcher.clearError();
 			if (stencilOK) {
-				tglStencilPlain=address+0x52DE0;tglStencilCompress=address+0x52DAA;
+				tglStencilPlain=address+0x52DE0;tglStencilCompress=address+0x52DAA;tglStencilSkip=address+0x52E0D;
 				uint8_t jump[19] {0xFF,0x25,0,0,0,0};
 				const auto target=reinterpret_cast<uintptr_t>(tglStencilCompressBridge);
 				memcpy(jump+6,&target,sizeof(target));memset(jump+14,0x90,5);
