@@ -560,9 +560,11 @@ static bool tglPatchHeapDepthGates(KernelPatcher &patcher,mach_vm_address_t addr
  return ready;
 }
 uint32_t tglCCSAlignmentCounts[3] {}; // calls, CCS_E states, corrected
+uint32_t tglStencilViewAuxNone {}; // R8_UINT stencil views given AUX_NONE
 bool tglCCSAlignmentSerialize(void *,void *,OSSerialize *serializer) {
- uint32_t out[4] {127};
+ uint32_t out[5] {127};
  for (unsigned i=0;i<3;++i) out[i+1]=__atomic_load_n(&tglCCSAlignmentCounts[i],__ATOMIC_RELAXED);
+ out[4]=__atomic_load_n(&tglStencilViewAuxNone,__ATOMIC_RELAXED);
  auto data=OSData::withBytes(out,sizeof(out));if (!data) return false;
  const bool ok=data->serialize(serializer);data->release();return ok;
 }
@@ -15276,6 +15278,14 @@ uint64_t XE::wrapTGLBlitLibSetup3D(void *context,void *stream) {
  return result;
 }
 void XE::wrapTGLSurfaceAux(void *resource,void *entry,uint32_t *surface,uint32_t intent) {
+ // EXPERIMENT: a D32S8 stencil is never written compressed (stencil gate), but
+ // it shares the depth's compression flag, so an R8_UINT stencil view got CCS
+ // and samplers decoded stale CCS on reused memory. Give it Apple's own
+ // uncompressed result (AUX_NONE) for resources with a stencil plane.
+ if (*reinterpret_cast<const uint32_t *>(static_cast<const uint8_t *>(entry)+0x44) && ((surface[0]>>18)&0x1FFU)==0x143) {
+  surface[6]&=~7U;
+  __atomic_fetch_add(&tglStencilViewAuxNone,1,__ATOMIC_RELAXED);
+ } else
  FunctionCast(wrapTGLSurfaceAux,callbackXE->orgTGLSurfaceAux)(resource,entry,surface,intent);
  __atomic_fetch_add(&tglCCSAlignmentCounts[0],1,__ATOMIC_RELAXED);
  __atomic_fetch_add(&tglSurfaceCounts.auxTile[surface[6]&7U][(surface[0]>>12)&3U],1,__ATOMIC_RELAXED);
