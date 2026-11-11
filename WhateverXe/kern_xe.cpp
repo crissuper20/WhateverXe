@@ -149,18 +149,28 @@ extern "C" __attribute__((naked,used)) void tglTahoeMatrixBridge() {
   "1: jmpq *_tglSonomaMatrixZero(%rip)\n"
   "2: jmpq *_tglSonomaMatrixOther(%rip)\n");
 }
-// EXPERIMENT: at submit IntelMTLRenderFunctions::execute ORs compression into a
-// Metal STENCIL_BUFFER (dw1 bits 24/25, 52daa) and maps it in the AUX table when the
-// resource can compress. A stencil-only WM_HZ_OP clear of that buffer hangs the
-// render engine. For STENCIL_BUFFER only, take the kext's own uncompressed branch
-// at 52de0, which resolves CCS first if the resource is dirty.
+// EXPERIMENT: Metal depth/stencil compression on TGL.
+// A Depth32Float_Stencil8 texture has a depth plane and a stencil plane that
+// share one ResourceInfoEntry, so Apple tracks a single "compressed" flag
+// (entry+0x91 bit 1) for both. At submit, IntelMTLRenderFunctions::execute
+// (kext 0x52d97) picks a branch for each depth/stencil packet:
+//  - compress (0x52daa): set the packet's CCS bits, map the AUX table and set
+//    the flag. A compressed stencil hangs the render engine on a stencil-only
+//    WM_HZ_OP clear, and Apple never initialises the stencil CCS (Bspec wants a
+//    stencil HZ_OP clear first), so stencil reads saw garbage.
+//  - plain (0x52de0): resolve CCS if dirty, then clear the flag. Fine for
+//    resources that cannot compress.
+//  - continue (0x52e0d): the bookkeeping after both, with no CCS change.
+// We never compress the stencil, so the hang cannot happen. A STENCIL_BUFFER
+// packet takes "continue", not "plain": "plain" would clear the flag the depth
+// plane still needs, and depth sampled later would read compressed data as if
+// it were plain. Everything else keeps Apple's own choice. Stencil views are
+// handled in wrapTGLSurfaceAux.
 extern "C" {
 uintptr_t tglStencilPlain, tglStencilCompress, tglStencilSkip;
 }
-// A D32S8 stencil shares its ResourceInfoEntry with the depth. The plain branch
-// resolves the entry and clears its compression flag (0x91 bit 1), so depth
-// programmed as compressed in the same batch was later sampled as uncompressed.
-// A stencil packet now skips both and leaves the entry to the depth.
+// Registers on entry are execute's: r12 = ResourceInfoEntry, r15+rax*4 = the
+// packet's first dword (0x78060006 = 3DSTATE_STENCIL_BUFFER).
 extern "C" __attribute__((naked,used)) void tglStencilCompressBridge() {
  asm volatile(
   "movq 0x10(%rbp), %rcx\n"
@@ -11416,7 +11426,7 @@ bool XE::processTGLAccelerator(KernelPatcher &patcher, size_t index, mach_vm_add
 			IORegistryEntry::getRegistryRoot()->setProperty("TGLRenderPassFlushReady",flushOK);
 			IORegistryEntry::getRegistryRoot()->setProperty("TGLRenderPassTileFlushReady",flushOK);
 			IORegistryEntry::getRegistryRoot()->setProperty("TGLRenderPassConstAlternativeReady",flushOK);
-			// EXPERIMENT: send STENCIL_BUFFER down the uncompressed branch (see bridge).
+			// EXPERIMENT: never compress the Metal stencil (see tglStencilCompressBridge).
 			const uint8_t stencilCompress[] {0x41,0x83,0x7C,0x24,0x44,0x00,0x48,0x8B,0x4D,0x10,0x74,0x3D,
 				0x48,0x8B,0x85,0x60,0xFF,0xFF,0xFF,0x41,0x80,0x4C,0x87,0x07,0x03};
 			bool stencilOK=size>0x52DE6 &&
@@ -15278,10 +15288,13 @@ uint64_t XE::wrapTGLBlitLibSetup3D(void *context,void *stream) {
  return result;
 }
 void XE::wrapTGLSurfaceAux(void *resource,void *entry,uint32_t *surface,uint32_t intent) {
- // EXPERIMENT: a D32S8 stencil is never written compressed (stencil gate), but
- // it shares the depth's compression flag, so an R8_UINT stencil view got CCS
- // and samplers decoded stale CCS on reused memory. Give it Apple's own
- // uncompressed result (AUX_NONE) for resources with a stencil plane.
+ // EXPERIMENT: a shader or blit reading only the stencil of a D32S8 texture
+ // gets an R8_UINT surface. The stencil is never written compressed (see
+ // tglStencilCompressBridge), but the shared flag says "compressed" for the
+ // depth, so Apple would describe this surface with CCS and the hardware would
+ // decode whatever stale CCS sits on reused memory. Give R8_UINT surfaces of a
+ // resource with a stencil plane (entry+0x44) AUX_NONE, which is what Apple
+ // writes for an uncompressed resource. All other surfaces are unchanged.
  if (*reinterpret_cast<const uint32_t *>(static_cast<const uint8_t *>(entry)+0x44) && ((surface[0]>>18)&0x1FFU)==0x143) {
   surface[6]&=~7U;
   __atomic_fetch_add(&tglStencilViewAuxNone,1,__ATOMIC_RELAXED);
