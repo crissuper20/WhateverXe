@@ -1,0 +1,39 @@
+--- a/itlwm/hal_iwx/ItlIwx.cpp
++++ b/itlwm/hal_iwx/ItlIwx.cpp
+@@ -2921,4 +2921,32 @@
+-    /*
+-     * Disable L0s and L1s in PCIE register because we don't support ASPM now.
+-     */
+-    lctl &= ~(PCI_PCIE_LCSR_ASPM_L0S | PCI_PCIE_LCSR_ASPM_L1);
++    if (OSDynamicCast(OSBoolean, sc->sc_pcitag->getProperty("itlwm-aspm")))
++    {
++        // ASPM is per link: both endpoints' LNKCTL counts. With the property,
++        // force L1 on this device and on the nearest upstream port; L0s stays
++        // banned (upstream: unstable on AX-series devices). Only L1 entry is
++        // forced, which is the precondition for the L1.1/L1.2 substates.
++        lctl &= ~PCI_PCIE_LCSR_ASPM_L0S;
++        lctl |= PCI_PCIE_LCSR_ASPM_L1;
++        IORegistryEntry *up = sc->sc_pcitag;
++        for (unsigned hop = 0; hop < 6 && up; hop++)
++        {
++            up = up->getParentEntry(gIOServicePlane);
++            if (auto port = OSDynamicCast(IOPCIDevice, up))
++            {
++                UInt8 cap = 0;
++                if (port->findPCICapability(kIOPCIPCIExpressCapability, &cap))
++                {
++                    uint16_t lcaps = port->configRead16(cap + 0x0C);
++                    if (lcaps & 0x0800) // LNKCAP ASPM L1 support
++                    {
++                        uint16_t pctl = port->configRead16(cap + 0x10);
++                        port->configWrite16(cap + 0x10, (pctl & ~1) | 2);
++                    }
++                }
++                break;
++            }
++        }
++    }
++    else
++    {
++        lctl &= ~(PCI_PCIE_LCSR_ASPM_L0S | PCI_PCIE_LCSR_ASPM_L1);
++    }
