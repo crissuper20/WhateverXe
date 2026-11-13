@@ -49,6 +49,7 @@ struct XE {
  }gpu;
  struct {void processKernel(KernelPatcher&,void*){}}modDVMTCalcFix;
  void xelpReadFirmware(GPU*){++firmware;}
+ void pmcProbeStart(GPU*){}
  void xelpLoadDisplayPool(GPU*){++pool;}
  void adlnBootstrap(GPU*){++bootstrap;}
  void tglVMPrepare(KernelPatcher&,GPU*){++vm;}

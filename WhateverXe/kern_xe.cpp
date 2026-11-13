@@ -1,5 +1,9 @@
 #include "kern_display13_color.hpp"
 #include "kern_hang_capture_policy.hpp"
+#include "kern_cmd_capture_policy.hpp"
+#include <sys/sysctl.h>
+#include <sys/proc.h>
+SYSCTL_DECL(_debug); // global scope: the kernel exports sysctl__debug_children unmangled
 #include <mach/clock.h>
 //
 //  kern_xe.cpp
@@ -325,6 +329,13 @@ uint32_t tglRecoveryCalls {}, tglRecoveryReturns {};
 uint64_t tglRecoveryRecords[16][16] {};
 TGLRecovery::Snapshot tglRecoverySnapshot {};
 void (*tglRecoveryForceWake)(void *,bool,uint32_t) {};
+// Freeze breadcrumbs (debug.wex_crumbs): per stage, how many threads are inside, entries, and the uptime of the
+// last entry and exit. A stage stuck with inside>0 and an old entry time names the loop a hard freeze sits in.
+enum CrumbStage {crumbSubmit,crumbRegs,crumbRecovery,crumbStages};
+struct Crumb {uint64_t inside,entries,entered,left;};
+static Crumb crumbs[crumbStages];
+static void crumbEnter(unsigned s) {uint64_t t;clock_get_uptime(&t);__atomic_store_n(&crumbs[s].entered,t,__ATOMIC_RELAXED);__atomic_add_fetch(&crumbs[s].entries,1,__ATOMIC_RELAXED);__atomic_add_fetch(&crumbs[s].inside,1,__ATOMIC_RELEASE);}
+static void crumbLeave(unsigned s) {uint64_t t;clock_get_uptime(&t);__atomic_store_n(&crumbs[s].left,t,__ATOMIC_RELAXED);__atomic_sub_fetch(&crumbs[s].inside,1,__ATOMIC_RELEASE);}
 bool tglRecoverySerialize(void *,void *,OSSerialize *serializer) {
 	uint64_t data[2+16*16] {};
 	data[0]=__atomic_load_n(&tglRecoveryCalls,__ATOMIC_ACQUIRE);
@@ -437,7 +448,9 @@ void XE::wrapTGLRecovery(void *channel) {
 	if (diff) tglDiffRead(mmio,tglDiffBefore);
 	tglRecoveryForceWake(owner,false,7);
 	const auto rcuBefore=tglRecoverySnapshot.shared[0];
+	crumbEnter(crumbRecovery);
 	const auto result=TGLRecovery::resetAndResume(channel);
+	crumbLeave(crumbRecovery);
 	if (diff) {
 		tglRecoveryForceWake(owner,true,7);tglDiffRead(mmio,tglDiffAfter);tglRecoveryForceWake(owner,false,7);
 		__atomic_store_n(&tglDiffState,2,__ATOMIC_RELEASE);
@@ -568,6 +581,28 @@ static bool tglPatchHeapDepthGates(KernelPatcher &patcher,mach_vm_address_t addr
  }
  SYSLOG("igfx","heap depth resolve gates ready=%d",ready);
  return ready;
+}
+// -wex-state-inval (diagnostic): the PIPE_CONTROL the kernel puts between Metal command buffers
+// (main and compute ring stamps) invalidates texture, constant and VF caches but not the state
+// cache, which holds surface and sampler states per DSS. Rewrite it like the completion-cache
+// trial does for the RCS/CCS constant-cache erratum: HDC flush + state-cache invalidate instead
+// of constant-cache invalidate. The Metal render pass PIPE_CONTROL already gets this (flushSites).
+// Runs after the flush and completion-cache checks, which compare the original bytes.
+static uint32_t tglPatchStateInval(KernelPatcher &patcher,mach_vm_address_t address,size_t size) {
+ const uint32_t sites[] {0x84EA4,0x4E500}; // main ring stamp, compute ring stamp
+ const uint8_t find[10] {0x48,0xB8,0x04,0x00,0x00,0x7A,0x98,0x44,0x10,0x01};
+ const uint8_t replace[10] {0x48,0xB8,0x04,0x02,0x00,0x7A,0x94,0x44,0x10,0x21};
+ uint32_t patched=0;
+ for (auto offset:sites) {
+  if (size<=offset+sizeof(find) || memcmp(reinterpret_cast<void *>(address+offset),find,sizeof(find))) continue;
+  auto site=reinterpret_cast<uint8_t *>(address+offset);
+  KernelPatcher::LookupPatch patch {&kextIntelTGL,find,replace,sizeof(find),1};
+  patcher.applyLookupPatch(&patch,site,sizeof(find)+1);
+  if (!memcmp(site,replace,sizeof(replace))) ++patched;
+  patcher.clearError();
+ }
+ SYSLOG("igfx","state cache invalidate stamps patched=%u of 2",patched);
+ return patched;
 }
 uint32_t tglCCSAlignmentCounts[3] {}; // calls, CCS_E states, corrected
 uint32_t tglStencilViewAuxNone {}; // R8_UINT stencil views given AUX_NONE
@@ -1226,6 +1261,322 @@ static __attribute__((noinline)) void hangCaptureInstall(KernelPatcher &patcher,
   patcher.clearError();
  }
  IORegistryEntry::getRegistryRoot()->setProperty("WEXHangCaptureReady",ready);
+}
+// EXPERIMENT (-wex-cmdcap): copy the next N submitted batches into one buffer.
+// sudo sysctl debug.wex_cmdcap=N arms it (and clears the buffer); debug.wex_cmdcap_data reads it.
+static uintptr_t cmdCaptureOriginal;
+static uint8_t *cmdCaptureBuffer;
+static uint32_t cmdCaptureLeft,cmdCapturePid;
+static uint64_t cmdCaptureUsed,cmdCaptureSequence;
+static CommandCapture::Bases cmdCaptureBases; // last seen; shared by all processes, approximate
+// Task GPU page table of a FIFO channel: channel+130 ring, ring+20 context, context+58 task, task+260 table.
+static uint64_t cmdCaptureTable(void *channel) {
+ uint64_t ring=0,context=0,task=0,table=0,vtable=0;
+ return tglPPGTTClass && tglVMRead(reinterpret_cast<uint64_t>(channel)+0x130,ring) && tglVMRead(ring+0x20,context) &&
+  tglVMRead(context+0x58,task) && tglVMRead(task+0x260,table) && tglVMRead(table,vtable) && vtable==tglPPGTTClass ? table : 0;
+}
+// Copies one GPU page after a Page header; returns its bytes, or null.
+static const uint8_t *cmdCapturePage(uint64_t table,uint64_t gpu,uint32_t kind,uint64_t sequence) {
+ using namespace CommandCapture;
+ const auto at=__atomic_fetch_add(&cmdCaptureUsed,sizeof(PageRecord)+pageBytes,__ATOMIC_RELAXED);
+ if(at+sizeof(PageRecord)+pageBytes>bufferBytes)return nullptr;
+ auto out=cmdCaptureBuffer+at;
+ PageRecord h {pageMagic,gpu&~uint64_t(pageBytes-1),sequence,kind,0};
+ const auto m=table?TGLPPGTT::inspect(table,h.gpu,tglVMRead):TGLPPGTT::Mapping{};
+ h.status=table?m.status:99;
+ const uint64_t cpu=tglVM.directBase+(m.physical&~uint64_t(pageBytes-1));
+ if(!h.status && (!tglVM.nofault || cpu<tglVM.directBase || cpu+pageBytes>tglVM.directEnd ||
+    tglVM.nofault(cpu,reinterpret_cast<uint64_t>(out+sizeof(h)),pageBytes)!=pageBytes))h.status=16;
+ memcpy(out,&h,sizeof(h));
+ return h.status?nullptr:out+sizeof(h);
+}
+// debug.wex_regs (read only, -wex-cmdcap): write a list of register offsets; they are read at once under
+// forcewake (IntelAccelerator::SafeForceWake, all domains, as GPU recovery does). The accelerator and its register
+// BAR come from the first submitted batch (accelerator +0x1240 must equal the ring's BAR pointer).
+// Read back: state (3 = values valid), count, BAR pointer, values.
+static constexpr unsigned regsMax=1024;
+static uint32_t regsOffsets[regsMax],regsValues[regsMax],regsCount,regsState;
+static uint64_t regsBase,regsAccelerator;
+static void regsAfterSubmit(void *channel) {
+ if(__atomic_load_n(&regsAccelerator,__ATOMIC_ACQUIRE) || !tglRecoveryForceWake)return;
+ uint64_t ring=0,mmio=0,accel=0,bar=0;
+ if(tglVMRead(reinterpret_cast<uint64_t>(channel)+0x130,ring) && ring && tglVMRead(ring+0x50,mmio) && mmio &&
+    tglVMRead(reinterpret_cast<uint64_t>(channel)+0x18,accel) && accel && tglVMRead(accel+0x1240,bar) && bar==mmio) {
+  regsBase=mmio;__atomic_store_n(&regsAccelerator,accel,__ATOMIC_RELEASE);
+ }
+}
+static int regsSysctl(struct sysctl_oid *,void *,int,struct sysctl_req *req) {
+ if(req->newptr) {
+  const auto accel=__atomic_load_n(&regsAccelerator,__ATOMIC_ACQUIRE);
+  if(!accel)return EAGAIN;
+  uint32_t busy=0;
+  if(!__atomic_compare_exchange_n(&regsState,&busy,2,false,__ATOMIC_ACQUIRE,__ATOMIC_RELAXED) &&
+     !(busy==3 && __atomic_compare_exchange_n(&regsState,&busy,2,false,__ATOMIC_ACQUIRE,__ATOMIC_RELAXED)))return EBUSY;
+  const size_t n=min(size_t(req->newlen)/4,size_t(regsMax));
+  if(int error=SYSCTL_IN(req,regsOffsets,n*4)) {__atomic_store_n(&regsState,0,__ATOMIC_RELEASE);return error;}
+  regsCount=static_cast<uint32_t>(n);
+  crumbEnter(crumbRegs);
+  tglRecoveryForceWake(reinterpret_cast<void *>(accel),true,7);
+  // An offset with bit 31 set is an MCR unicast read: bits 30:24 (slice 30:27, DSS 26:24) go into the MCR selector
+  // 0xFDC for that read only, then the selector is restored. Interrupts stay off around the loop.
+  const auto interrupts=ml_set_interrupts_enabled(false);
+  const auto selector=reinterpret_cast<volatile uint32_t *>(regsBase+0xFDC);
+  for(unsigned i=0;i<regsCount;++i) {
+   const auto o=regsOffsets[i],r=o&0x7FFFFF;
+   if(!(o&3) && (o>>31 || o<0x800000)) {
+    const uint32_t saved=o>>31?*selector:0;
+    if(o>>31)*selector=o&0x7F000000;
+    regsValues[i]=*reinterpret_cast<volatile uint32_t *>(regsBase+r);
+    if(o>>31)*selector=saved;
+   } else regsValues[i]=0xDEADBEEF;
+  }
+  ml_set_interrupts_enabled(interrupts);
+  tglRecoveryForceWake(reinterpret_cast<void *>(accel),false,7);
+  crumbLeave(crumbRegs);
+  __atomic_store_n(&regsState,3,__ATOMIC_RELEASE);
+  return 0;
+ }
+ const uint32_t head[2]={__atomic_load_n(&regsState,__ATOMIC_ACQUIRE),regsCount};
+ int error=SYSCTL_OUT(req,head,sizeof(head));
+ if(!error)error=SYSCTL_OUT(req,&regsBase,sizeof(regsBase));
+ if(!error && head[0]==3)error=SYSCTL_OUT(req,regsValues,regsCount*4);
+ return error;
+}
+SYSCTL_PROC(_debug,OID_AUTO,wex_regs,CTLTYPE_OPAQUE|CTLFLAG_RW,nullptr,0,regsSysctl,"S","WhateverXe register read after the next submit");
+// debug.wex_wa (-wex-cmdcap): writing 1 applies, under forcewake, the render workarounds Linux i915 applies to
+// Tiger Lake and Alder Lake-P (intel_workarounds.c rcs_engine_wa_init) that Apple's driver leaves clear:
+//   Wa_1409804808  ROW_CHICKEN2 0xE4F4 bit 8 PUSH_CONST_DEREF_HOLD_DIS (masked, multicast)
+//   Wa_14010229206 ROW_CHICKEN4 0xE48C bit 9 DISABLE_TDL_PUSH (masked, multicast)
+//   Wa_1607297627  RCS PSMI_CTL 0x2050 bits 7, 12 (masked)
+//   Wa_14010919138 FF_THREAD_MODE 0x20A0 bit 19 tessellation DOP gate disable
+// Reading returns the four registers.
+static constexpr uint32_t waRegs[4]={0xE4F4,0xE48C,0x2050,0x20A0};
+static int waSysctl(struct sysctl_oid *,void *,int,struct sysctl_req *req) {
+ const auto accel=__atomic_load_n(&regsAccelerator,__ATOMIC_ACQUIRE);
+ if(!accel)return EAGAIN;
+ auto reg=[](uint32_t o)->volatile uint32_t & {return *reinterpret_cast<volatile uint32_t *>(regsBase+o);};
+ uint32_t values[4];
+ if(req->newptr) {
+  int n=0;
+  if(int error=SYSCTL_IN(req,&n,sizeof(n)))return error;
+  if(n!=1)return EINVAL;
+  tglRecoveryForceWake(reinterpret_cast<void *>(accel),true,7);
+  reg(0xE4F4)=(1u<<8)<<16|(1u<<8);
+  reg(0xE48C)=(1u<<9)<<16|(1u<<9);
+  reg(0x2050)=((1u<<7)|(1u<<12))<<16|(1u<<7)|(1u<<12);
+  reg(0x20A0)=reg(0x20A0)|(1u<<19);
+  tglRecoveryForceWake(reinterpret_cast<void *>(accel),false,7);
+  SYSLOG("igfx","wex_wa: TGL/ADL-P render workarounds applied");
+  return 0;
+ }
+ tglRecoveryForceWake(reinterpret_cast<void *>(accel),true,7);
+ for(unsigned i=0;i<4;++i)values[i]=reg(waRegs[i]);
+ tglRecoveryForceWake(reinterpret_cast<void *>(accel),false,7);
+ return SYSCTL_OUT(req,values,sizeof(values));
+}
+SYSCTL_PROC(_debug,OID_AUTO,wex_wa,CTLTYPE_OPAQUE|CTLFLAG_RW,nullptr,0,waSysctl,"S","WhateverXe: apply TGL/ADL-P render workarounds (write 1)");
+// -wex-tgl-blitsync (diagnostic): before a 2D-engine batch (first dword is an XY_ blit, client 2) is submitted, wait up
+// to 2 ms for the render ring to drain (RING_HEAD 0x2034 == RING_TAIL 0x2030). Tests whether War Thunder's terrain cache
+// tiles break because a blit runs while the render engine still writes its source. debug.wex_blitsync: blit batches,
+// blits that found the render ring busy, timeouts, total wait microseconds.
+static bool blitSyncOn;
+static uint64_t blitSyncStats[4];
+static void blitSync(const void *descriptor) {
+ uint64_t cpu=0;memcpy(&cpu,static_cast<const uint8_t *>(descriptor)+CommandCapture::cpuField,8);
+ uint32_t first=0;
+ if(!cpu || !tglVM.nofault || tglVM.nofault(cpu,reinterpret_cast<uint64_t>(&first),4)!=4 || first>>29!=2)return;
+ __atomic_add_fetch(&blitSyncStats[0],1,__ATOMIC_RELAXED);
+ const auto head=reinterpret_cast<volatile uint32_t *>(regsBase+0x2034),tail=reinterpret_cast<volatile uint32_t *>(regsBase+0x2030);
+ auto idle=[&]{return ((*head^*tail)&0x1FFFF8)==0;};
+ if(idle())return;
+ __atomic_add_fetch(&blitSyncStats[1],1,__ATOMIC_RELAXED);
+ unsigned us=0;
+ while(!idle() && us<2000){IODelay(5);us+=5;}
+ if(us>=2000)__atomic_add_fetch(&blitSyncStats[2],1,__ATOMIC_RELAXED);
+ __atomic_add_fetch(&blitSyncStats[3],us,__ATOMIC_RELAXED);
+}
+static int blitSyncRead(struct sysctl_oid *,void *,int,struct sysctl_req *req) {
+ uint64_t copy[4];for(unsigned i=0;i<4;++i)copy[i]=__atomic_load_n(&blitSyncStats[i],__ATOMIC_RELAXED);
+ return SYSCTL_OUT(req,copy,sizeof(copy));
+}
+SYSCTL_PROC(_debug,OID_AUTO,wex_blitsync,CTLTYPE_OPAQUE|CTLFLAG_RD,nullptr,0,blitSyncRead,"S","WhateverXe blit-after-render wait: blits, busy, timeouts, microseconds");
+static void cmdCaptureSubmit(void *channel,void *descriptor) {
+ using namespace CommandCapture;
+ const uint32_t pid=static_cast<uint32_t>(proc_selfpid()),only=__atomic_load_n(&cmdCapturePid,__ATOMIC_RELAXED);
+ uint32_t left=only && only!=pid?0:__atomic_load_n(&cmdCaptureLeft,__ATOMIC_RELAXED);
+ while(left && !__atomic_compare_exchange_n(&cmdCaptureLeft,&left,left-1,false,__ATOMIC_RELAXED,__ATOMIC_RELAXED)) {}
+ if(left && descriptor) {
+  auto field=[descriptor](size_t offset){return reinterpret_cast<const uint8_t *>(descriptor)+offset;};
+  Record r {};
+  r.magic=magic;
+  memcpy(&r.gpu,field(gpuField),8);memcpy(&r.cpu,field(cpuField),8);memcpy(&r.dwords,field(dwordsField),4);
+  r.flags=*field(endField)|(*field(flagA)<<8)|(*field(flagB)<<16);
+  r.pid=pid;proc_selfname(r.name,sizeof(r.name));
+  uint64_t ticks;clock_get_uptime(&ticks);absolutetime_to_nanoseconds(ticks,&r.uptime);
+  const uint64_t bytes=r.cpu && r.dwords?min(uint64_t(r.dwords)*4,uint64_t(maxBatchBytes)):0;
+  const auto at=__atomic_fetch_add(&cmdCaptureUsed,recordBytes(static_cast<uint32_t>(bytes)),__ATOMIC_RELAXED);
+  if(at+recordBytes(static_cast<uint32_t>(bytes))<=bufferBytes) {
+   auto out=cmdCaptureBuffer+at;
+   if(bytes && tglVM.nofault)r.copied=static_cast<uint32_t>(tglVM.nofault(r.cpu,reinterpret_cast<uint64_t>(out+sizeof(r)),bytes));
+   r.sequence=__atomic_fetch_add(&cmdCaptureSequence,1,__ATOMIC_RELAXED);
+   memcpy(out,&r,sizeof(r));
+   // Pages the batch points at: batch-start targets first (the kernel prolog sets the state bases).
+   const auto table=cmdCaptureTable(channel);
+   // Pages already taken this batch (gpu address, copied bytes); heap, as maxPages is large for the stack.
+   struct Seen {uint64_t gpu[maxPages];const uint8_t *data[maxPages];unsigned pages;};
+   auto seen=static_cast<Seen *>(IOMallocZero(sizeof(Seen)));
+   auto take=[&](uint64_t gpu,uint32_t kind)->const uint8_t * {
+    gpu&=~uint64_t(pageBytes-1);
+    if(!gpu || !seen)return nullptr;
+    for(unsigned i=0;i<seen->pages;++i)if(seen->gpu[i]==gpu)return seen->data[i];
+    if(seen->pages>=maxPages)return nullptr;
+    const auto data=cmdCapturePage(table,gpu,kind,r.sequence);
+    seen->gpu[seen->pages]=gpu;seen->data[seen->pages++]=data;
+    return data;
+   };
+   auto bases=cmdCaptureBases;
+   auto add=[&](uint64_t gpu,uint32_t kind) {
+    const auto page=take(gpu,kind);
+    if(page && kind==bindingTable) { // binding table entries: surface state offsets from the surface base
+     const auto offset=gpu&(pageBytes-1);
+     for(unsigned e=0;e<bindingEntries && offset+e*4+4<=pageBytes;++e) {
+      uint32_t entry;memcpy(&entry,page+offset+e*4,4);
+      if(entry)take(bases.surface+(entry&~0x3FU),surfaceState);
+     }
+    }
+   };
+   const auto words=reinterpret_cast<const uint32_t *>(out+sizeof(r));
+   const size_t count=r.copied/4;
+   // The batch itself (the kernel prolog sets the state bases), then each batch-start target: the process's own
+   // command stream, followed page by page until MI_BATCH_BUFFER_END, with every page it points at.
+   scan(words,count,bases,add);
+   for(size_t i=0;i<count;i+=max(commandLength(words[i]),1U))if((words[i]>>23)==0x31 && i+2<count) {
+    uint64_t at=((uint64_t(words[i+2]&0xFFFF)<<32)|words[i+1])&~3ULL;
+    for(unsigned p=0;p<streamPages;++p) {
+     const auto page=take(at,batchStart);
+     if(!page)break;
+     const auto o=at&(pageBytes-1);
+     const auto past=scan(reinterpret_cast<const uint32_t *>(page+o),(pageBytes-o)/4,bases,add);
+     if(past==~size_t(0))break;
+     at=(at&~uint64_t(pageBytes-1))+pageBytes+past*4;
+    }
+   }
+   if(seen)IOFree(seen,sizeof(Seen));
+   cmdCaptureBases=bases;
+  }
+ }
+ if(blitSyncOn && descriptor && regsBase)blitSync(descriptor);
+ crumbEnter(crumbSubmit);
+ FunctionCast(cmdCaptureSubmit,cmdCaptureOriginal)(channel,descriptor);
+ crumbLeave(crumbSubmit);
+ regsAfterSubmit(channel);
+}
+static int cmdCaptureArm(struct sysctl_oid *,void *,int,struct sysctl_req *req) {
+ int n=static_cast<int>(__atomic_load_n(&cmdCaptureLeft,__ATOMIC_RELAXED));
+ int error=SYSCTL_OUT(req,&n,sizeof(n)); // sysctl_handle_int is not exported
+ if(error || !req->newptr)return error;
+ if((error=SYSCTL_IN(req,&n,sizeof(n))))return error;
+ __atomic_store_n(&cmdCaptureLeft,0,__ATOMIC_RELAXED);
+ memset(cmdCaptureBuffer,0,CommandCapture::bufferBytes);
+ __atomic_store_n(&cmdCaptureUsed,0,__ATOMIC_RELAXED);
+ __atomic_store_n(&cmdCaptureSequence,0,__ATOMIC_RELAXED);
+ cmdCaptureBases={};
+ __atomic_store_n(&cmdCaptureLeft,static_cast<uint32_t>(max(n,0)),__ATOMIC_RELAXED);
+ SYSLOG("igfx","command capture armed for %d batches",n);
+ return 0;
+}
+// Reads at most readBytes from debug.wex_cmdcap_at MB (one sysctl copy fails above ~64 MB).
+static uint32_t cmdCaptureAt;
+static int cmdCaptureRead(struct sysctl_oid *,void *,int,struct sysctl_req *req) {
+ const auto used=min(__atomic_load_n(&cmdCaptureUsed,__ATOMIC_RELAXED),uint64_t(CommandCapture::bufferBytes));
+ const auto from=min(uint64_t(__atomic_load_n(&cmdCaptureAt,__ATOMIC_RELAXED))<<20,used);
+ return SYSCTL_OUT(req,cmdCaptureBuffer+from,min(used-from,uint64_t(CommandCapture::readBytes)));
+}
+SYSCTL_UINT(_debug,OID_AUTO,wex_cmdcap_at,CTLFLAG_RW,&cmdCaptureAt,0,"WhateverXe command capture: read offset in MB");
+static int crumbsRead(struct sysctl_oid *,void *,int,struct sysctl_req *req) {
+ Crumb copy[crumbStages];
+ for(unsigned i=0;i<crumbStages;++i)copy[i]={__atomic_load_n(&crumbs[i].inside,__ATOMIC_ACQUIRE),__atomic_load_n(&crumbs[i].entries,__ATOMIC_RELAXED),
+  __atomic_load_n(&crumbs[i].entered,__ATOMIC_RELAXED),__atomic_load_n(&crumbs[i].left,__ATOMIC_RELAXED)};
+ return SYSCTL_OUT(req,copy,sizeof(copy));
+}
+SYSCTL_PROC(_debug,OID_AUTO,wex_crumbs,CTLTYPE_OPAQUE|CTLFLAG_RD,nullptr,0,crumbsRead,"S","WhateverXe freeze breadcrumbs");
+SYSCTL_PROC(_debug,OID_AUTO,wex_cmdcap,CTLTYPE_INT|CTLFLAG_RW,nullptr,0,cmdCaptureArm,"I","WhateverXe command capture: batches left");
+static int cmdCaptureOnly(struct sysctl_oid *,void *,int,struct sysctl_req *req) {
+ uint32_t n=__atomic_load_n(&cmdCapturePid,__ATOMIC_RELAXED);
+ int error=SYSCTL_OUT(req,&n,sizeof(n));
+ if(error || !req->newptr || (error=SYSCTL_IN(req,&n,sizeof(n))))return error;
+ __atomic_store_n(&cmdCapturePid,n,__ATOMIC_RELAXED);
+ return 0;
+}
+SYSCTL_PROC(_debug,OID_AUTO,wex_cmdcap_pid,CTLTYPE_INT|CTLFLAG_RW,nullptr,0,cmdCaptureOnly,"I","WhateverXe command capture: only this pid (0 = all)");
+SYSCTL_PROC(_debug,OID_AUTO,wex_cmdcap_data,CTLTYPE_OPAQUE|CTLFLAG_RD,nullptr,0,cmdCaptureRead,"S","WhateverXe command capture records");
+// -wex-tgl-garb keeper (diagnostic): GARBCNTL 0xB004 bit 7 is clear after engine start (as on Linux) but comes back while
+// running. Every 100 ms, under forcewake, clear it again. debug.wex_garb reads checks, fixes and the last value seen set.
+// -wex-tgl-norc6 (diagnostic, same keeper): keep render C6 and power gating off as Linux intel_rc6_disable does,
+// RC_CONTROL 0xA090 = 0 and PG_ENABLE 0xA210 = 0; debug.wex_garb words 3-5 = RC6 fixes, last RC_CONTROL, last PG_ENABLE.
+static thread_call_t garbCall;
+static bool garbOn,norc6On;
+static uint64_t garbStats[6];
+static void garbKeep(thread_call_param_t,thread_call_param_t) {
+ const auto accel=__atomic_load_n(&regsAccelerator,__ATOMIC_ACQUIRE);
+ if(accel && tglRecoveryForceWake) {
+  tglRecoveryForceWake(reinterpret_cast<void *>(accel),true,7);
+  auto garb=reinterpret_cast<volatile uint32_t *>(regsBase+0xB004);
+  const uint32_t v=*garb;
+  if(garbOn && v!=0xFFFFFFFF && (v&0x80)) {*garb=v&~0x80U;__atomic_add_fetch(&garbStats[1],1,__ATOMIC_RELAXED);__atomic_store_n(&garbStats[2],v,__ATOMIC_RELAXED);}
+  auto rc=reinterpret_cast<volatile uint32_t *>(regsBase+0xA090),pg=reinterpret_cast<volatile uint32_t *>(regsBase+0xA210);
+  const uint32_t r=*rc,g=*pg;
+  if(norc6On && r!=0xFFFFFFFF && (r || g)) {*rc=0;*pg=0;__atomic_add_fetch(&garbStats[3],1,__ATOMIC_RELAXED);
+   __atomic_store_n(&garbStats[4],r,__ATOMIC_RELAXED);__atomic_store_n(&garbStats[5],g,__ATOMIC_RELAXED);}
+  tglRecoveryForceWake(reinterpret_cast<void *>(accel),false,7);
+  __atomic_add_fetch(&garbStats[0],1,__ATOMIC_RELAXED);
+ }
+ uint64_t deadline;clock_interval_to_deadline(100,kMillisecondScale,&deadline);
+ thread_call_enter_delayed(garbCall,deadline);
+}
+static int garbRead(struct sysctl_oid *,void *,int,struct sysctl_req *req) {
+ uint64_t copy[6];for(unsigned i=0;i<6;++i)copy[i]=__atomic_load_n(&garbStats[i],__ATOMIC_RELAXED);
+ return SYSCTL_OUT(req,copy,sizeof(copy));
+}
+SYSCTL_PROC(_debug,OID_AUTO,wex_garb,CTLTYPE_OPAQUE|CTLFLAG_RD,nullptr,0,garbRead,"S","WhateverXe GARBCNTL bit 7 keeper: checks, fixes, last value");
+static __attribute__((noinline)) void cmdCaptureInstall(KernelPatcher &patcher,size_t index,mach_vm_address_t address,size_t size) {
+ const bool capture=checkKernelArgument("-wex-cmdcap");
+ blitSyncOn=checkKernelArgument("-wex-tgl-blitsync");
+ if(!capture && !blitSyncOn)return;
+ const char *symbol="__ZN18IGAccelFIFOChannel12submitBufferEP24IOAccelCommandDescriptor";
+ // Head up to the descriptor loads: 0x20 batch pointer, 0x30 dword count, 0x68 end flag.
+ static const uint8_t head[] {0x55,0x48,0x89,0xE5,0x41,0x57,0x41,0x56,0x41,0x55,0x41,0x54,0x53,0x48,0x83,0xEC,0x18,0x48,0x8B,0x47,0x18};
+ bool ready=size>0x4C9A0 && patcher.solveSymbol<mach_vm_address_t>(index,symbol,address,size)==address+0x4C6C6 &&
+  !memcmp(reinterpret_cast<const void *>(address+0x4C6C6),head,sizeof(head));
+ patcher.clearError();
+ const auto pgClass=patcher.solveSymbol<mach_vm_address_t>(index,"__ZTV31IGHardwarePerProcessPageTable64",address,size);
+ patcher.clearError();
+ if(ready && !tglPPGTTClass && pgClass==address+0xCC220)tglPPGTTClass=pgClass+16; // page walks; batches are captured either way
+ if(ready && capture)cmdCaptureBuffer=static_cast<uint8_t *>(IOMalloc(CommandCapture::bufferBytes));
+ ready=ready && (cmdCaptureBuffer || !capture);
+ if(ready) {
+  KernelPatcher::RouteRequest route(symbol,cmdCaptureSubmit,cmdCaptureOriginal);
+  ready=patcher.routeMultiple(index,&route,1,address,size);
+  patcher.clearError();
+ }
+ if(ready && blitSyncOn)sysctl_register_oid(&sysctl__debug_wex_blitsync);
+ if(ready && capture) {
+  sysctl_register_oid(&sysctl__debug_wex_cmdcap);
+  sysctl_register_oid(&sysctl__debug_wex_cmdcap_data);
+  sysctl_register_oid(&sysctl__debug_wex_cmdcap_at);
+  sysctl_register_oid(&sysctl__debug_wex_cmdcap_pid);
+  sysctl_register_oid(&sysctl__debug_wex_regs);
+  sysctl_register_oid(&sysctl__debug_wex_wa);
+  sysctl_register_oid(&sysctl__debug_wex_crumbs);
+  garbOn=checkKernelArgument("-wex-tgl-garb");norc6On=checkKernelArgument("-wex-tgl-norc6");
+  if((garbOn || norc6On) && (garbCall=thread_call_allocate(garbKeep,nullptr))) {
+   sysctl_register_oid(&sysctl__debug_wex_garb);
+   uint64_t deadline;clock_interval_to_deadline(100,kMillisecondScale,&deadline);
+   thread_call_enter_delayed(garbCall,deadline);
+  }
+ }
+ IORegistryEntry::getRegistryRoot()->setProperty("WEXCommandCaptureReady",ready);
+ SYSLOG("igfx","command capture %s",ready?"ready":"not admitted");
 }
 static __attribute__((noinline)) void adlnPrepareRCSProfile(KernelPatcher &patcher,size_t index,mach_vm_address_t address,size_t size) {
   // Qualify these native entries before the ordinary host observer routes.
@@ -10818,6 +11169,7 @@ bool XE::processTGLAccelerator(KernelPatcher &patcher, size_t index, mach_vm_add
  IORegistryEntry::getRegistryRoot()->setProperty("TGLSonomaSurfaceAcceleratorReady",surfaceABIReady);
  if(adlnDetected && (checkKernelArgument("-wex-adln-kernel-ctx") || adlnNativeRCSProfileRequested))adlnPrepareRCSProfile(patcher,index,address,size);
  hangCaptureInstall(patcher,index,address,size); // EXPERIMENT
+ cmdCaptureInstall(patcher,index,address,size); // EXPERIMENT
    // Serialize only the two direct stores in detectEDRAM. The original
    // forcewake and 1000ms sleep remain outside the shared gate.
    {
@@ -10958,14 +11310,22 @@ bool XE::processTGLAccelerator(KernelPatcher &patcher, size_t index, mach_vm_add
 				(xeProfile.gt==XELP::GT::TGLG4 ? urbReplaceG4 : urbReplace);
 			auto gpuInfo=patcher.solveSymbol<mach_vm_address_t>(index,
 				"__ZN16IntelAccelerator10getGPUInfoEv",address,size);
+			// Diagnostic: -wex-urb-banks5 publishes five URB banks. An RPL-P fork
+			// with the same 64-EU/6-bank part lost GL geometry until it published 5
+			// (samranahmad09/WhateverXe-RaptorLakeP).
+			uint8_t urbBytes[sizeof(urbFind)];
+			memcpy(urbBytes,urbReplacement,sizeof(urbFind));
+			if (checkKernelArgument("-wex-urb-banks5")) urbBytes[17]=5;
+			SYSLOG("igfx","URB banks native=%u published=%u",urbReplacement[17],urbBytes[17]);
+			IORegistryEntry::getRegistryRoot()->setProperty("TGLURBBanksPublished",urbBytes[17],32);
 			auto urbSite=reinterpret_cast<uint8_t *>(address+0x28781);
 			bool urbReady=skuReady && gpuInfo==address+0x2847E && size>0x28796 &&
 				!memcmp(urbSite,urbFind,sizeof(urbFind));
 			patcher.clearError();
 			if (urbReady) {
-				KernelPatcher::LookupPatch patch {currentGraphics,urbFind,urbReplacement,sizeof(urbFind),1};
+				KernelPatcher::LookupPatch patch {currentGraphics,urbFind,urbBytes,sizeof(urbFind),1};
 				patcher.applyLookupPatch(&patch,urbSite,sizeof(urbFind)+1);
-				urbReady=patcher.getError()==KernelPatcher::Error::NoError && !memcmp(urbSite,urbReplacement,sizeof(urbFind));
+				urbReady=patcher.getError()==KernelPatcher::Error::NoError && !memcmp(urbSite,urbBytes,sizeof(urbFind));
 			}
 			IORegistryEntry::getRegistryRoot()->setProperty("TGLURBBankTopologyReady",urbReady);
 			patcher.clearError();
@@ -11346,6 +11706,19 @@ bool XE::processTGLAccelerator(KernelPatcher &patcher, size_t index, mach_vm_add
 			IORegistryEntry::getRegistryRoot()->setProperty("TGLCCSAlignmentReady",auxAlignOK);
 			if (routeTGLBlitLib(patcher,index,address,size)) IORegistryEntry::getRegistryRoot()->setProperty("TGLBlitLibAuxReady",kOSBooleanTrue);
 			IORegistryEntry::getRegistryRoot()->setProperty("TGLHeapDepthGatesReady",tglPatchHeapDepthGates(patcher,address,size));
+			if (checkKernelArgument("-wex-vram3g")) {
+				// Head: push rbp/mov rbp,rsp/push r15,r14,r12,rbx/mov rbx,rcx (14 bytes, no relative operands).
+				const uint8_t head[] {0x55,0x48,0x89,0xE5,0x41,0x57,0x41,0x56,0x41,0x54,0x53,0x48,0x89,0xCB};
+				const char *init="__ZN15IGMemoryManager4initEP16IntelAcceleratorRK18IntelSharedMemInfoRK14_stolenMemInfo";
+				bool vram=patcher.solveSymbol<mach_vm_address_t>(index,init,address,size)==address+0xE580 &&
+					!memcmp(reinterpret_cast<void *>(address+0xE580),head,sizeof(head));
+				patcher.clearError();
+				if (vram) {
+					KernelPatcher::RouteRequest route(init,wrapTGLMemoryManagerInit,orgTGLMemoryManagerInit);
+					vram=patcher.routeMultiple(index,&route,1,address,size);patcher.clearError();
+				}
+				IORegistryEntry::getRegistryRoot()->setProperty("TGLVRAMRouteReady",vram);
+			}
 			if (auto live=OSSerializer::forTarget(nullptr,tglCCSAlignmentSerialize)) {
 				IORegistryEntry::getRegistryRoot()->setProperty("TGLCCSAlignmentLive",live);live->release();
 			}
@@ -11435,6 +11808,12 @@ bool XE::processTGLAccelerator(KernelPatcher &patcher, size_t index, mach_vm_add
 			patcher.clearError();
 			if (stencilOK) {
 				tglStencilPlain=address+0x52DE0;tglStencilCompress=address+0x52DAA;tglStencilSkip=address+0x52E0D;
+				// EXPERIMENT: every depth/stencil packet takes the plain branch, so no Metal depth buffer is compressed
+				// (no CCS bits, no AUX table mapping, flag always clear). Apple compresses only depth buffers with a
+				// stencil plane here; with that compression War Thunder hard-froze the whole machine within minutes of
+				// flight on Raptor Lake-P (GPU state healthy to the last 100 ms sample, NMI not taken), and ran 15+
+				// minutes without it. -wex-tgl-depthccs restores Apple's choice (diagnostic).
+				if (!checkKernelArgument("-wex-tgl-depthccs")) tglStencilCompress=tglStencilSkip=tglStencilPlain;
 				uint8_t jump[19] {0xFF,0x25,0,0,0,0};
 				const auto target=reinterpret_cast<uintptr_t>(tglStencilCompressBridge);
 				memcpy(jump+6,&target,sizeof(target));memset(jump+14,0x90,5);
@@ -11444,6 +11823,7 @@ bool XE::processTGLAccelerator(KernelPatcher &patcher, size_t index, mach_vm_add
 				patcher.clearError();
 			}
 			IORegistryEntry::getRegistryRoot()->setProperty("TGLStencilCompressGateReady",stencilOK);
+			IORegistryEntry::getRegistryRoot()->setProperty("TGLDepthCompressionOff",stencilOK && tglStencilCompress==tglStencilPlain);
 			SYSLOG("igfx","TGL stencil compression gate ready=%d",stencilOK);
 			// The outer RCS completion emitter is separate from the render-pass
 			// emitter above. Apply the same Vol14 constant-cache alternative to
@@ -11502,6 +11882,43 @@ bool XE::processTGLAccelerator(KernelPatcher &patcher, size_t index, mach_vm_add
 			}
 			IORegistryEntry::getRegistryRoot()->setProperty("TGLCompletionConstAlternativeRequested",completionCacheRequested);
 			IORegistryEntry::getRegistryRoot()->setProperty("TGLCompletionConstAlternativeReady",completionCacheRequested && completionCacheOK);
+			if (checkKernelArgument("-wex-state-inval") && !completionCacheRequested)
+				IORegistryEntry::getRegistryRoot()->setProperty("TGLStateInvalSites",tglPatchStateInval(patcher,address,size),32);
+			// -wex-tgl-nob104 (diagnostic): startGraphicsEngine sets bit 24 of the L3 register 0xB104 (MCR, undocumented in
+			// i915), which Linux leaves 0 on the same GPU. The patch makes that OR immediate 0.
+			if (checkKernelArgument("-wex-tgl-nob104")) {
+				const uint8_t find[] {0x81,0x88,0x04,0xB1,0,0,0,0,0,1},replace[] {0x81,0x88,0x04,0xB1,0,0,0,0,0,0};
+				auto site=reinterpret_cast<uint8_t *>(address+0x25BDB);
+				bool ok=size>0x25BE5 && !memcmp(site,find,sizeof(find));
+				if (ok) {
+					KernelPatcher::LookupPatch patch {currentGraphics,find,replace,sizeof(find),1};
+					patcher.applyLookupPatch(&patch,site,sizeof(find)+1);
+					ok=patcher.getError()==KernelPatcher::Error::NoError && !memcmp(site,replace,sizeof(replace));
+				}
+				patcher.clearError();
+				IORegistryEntry::getRegistryRoot()->setProperty("TGLNoB104Ready",ok);
+				SYSLOG("igfx","0xB104 bit 24 patch %s",ok?"applied":"not admitted");
+			}
+			// -wex-tgl-l3wb (diagnostic): IGMemoryManager::initCache copies g_cInitGfxL3ControlRegisters (32 dwords)
+			// into the L3 cacheability registers 0xB020-0xB09C. Apple marks MOCS entries 0-31 and 56-63 L3 uncached
+			// (0x10); Linux caches most of them (0x30). The patch makes every entry L3 write-back.
+			if (checkKernelArgument("-wex-tgl-l3wb")) {
+				static uint8_t find[0x80],replace[0x80];
+				for (unsigned i=0;i<0x80;i+=4) {
+					const uint32_t v=i>=0x40 && i<0x70 ? 0x00300030 : 0x00100010,wb=0x00300030;
+					memcpy(find+i,&v,4);memcpy(replace+i,&wb,4);
+				}
+				auto site=reinterpret_cast<uint8_t *>(address+0xA00D0);
+				bool ok=size>0xA0150 && !memcmp(site,find,sizeof(find));
+				if (ok) {
+					KernelPatcher::LookupPatch patch {currentGraphics,find,replace,sizeof(find),1};
+					patcher.applyLookupPatch(&patch,site,sizeof(find)+1);
+					ok=patcher.getError()==KernelPatcher::Error::NoError && !memcmp(site,replace,sizeof(replace));
+				}
+				patcher.clearError();
+				IORegistryEntry::getRegistryRoot()->setProperty("TGLL3WBReady",ok);
+				SYSLOG("igfx","L3 write-back table patch %s",ok?"applied":"not admitted");
+			}
 			const char *cpsRestore="__ZN17IGHardwareContext20restoreFromSafeImageEv";
 			const uint8_t cpsRestoreHead[] {0x55,0x48,0x89,0xe5,0x41,0x57,0x41,0x56,0x41,0x55,0x41,0x54,0x53,0x50};
 			const uint8_t cpsRestoreCall[] {0x4c,0x89,0xef,0xe8,0x61,0x2,0x0,0x0};
@@ -13375,6 +13792,15 @@ bool XE::wrapTGLPanelPowerProperty(IORegistryEntry *framebuffer, const char *, O
 // HDMI routing follows firmware wiring or an explicit board override.
 // Copy the donor description before any port/FB is constructed. A malformed
 // explicit profile or a mismatched donor connector must not be partly applied.
+// -wex-vram3g: IGMemoryManager::init stores IntelSharedMemInfo +4 as the device memory size
+// (VRAM,totalMB, and the Metal recommended working set): 1536 MB on this driver. Games size
+// their quality presets from it. Pass a copy with 3072 MB instead; only +0 and +4 are read.
+bool XE::wrapTGLMemoryManagerInit(void *manager, void *accelerator, const uint32_t *shared, const void *stolen) {
+ uint32_t copy[2] {shared[0],shared[1]};
+ if (copy[1]==1536U<<20) copy[1]=3072U<<20;
+ IORegistryEntry::getRegistryRoot()->setProperty("TGLVRAMBytes",copy[1],32);
+ return FunctionCast(wrapTGLMemoryManagerInit,callbackXE->orgTGLMemoryManagerInit)(manager,accelerator,copy,stolen);
+}
 bool XE::wrapTGLGetOSInformation(void *controller) {
  const auto r=FunctionCast(wrapTGLGetOSInformation,callbackXE->orgTGLGetOSInformation)(controller);
  if(r && !callbackXE->adlsDisplaySelected)tglBeginTCColdProtection(controller);
@@ -14302,7 +14728,27 @@ bool XE::wrapAlderLakeNNativeIRQ(IOService *that) {
 	return result;
 }
 
+// EXPERIMENT (-wex-tgl-wa): render workarounds Linux i915 applies to Tiger Lake and Alder Lake-P
+// (intel_workarounds.c rcs_engine_wa_init) whose flags Apple's driver leaves clear on this GPU. Setting the
+// flags before startGraphicsEngine lets Apple's own code program them, idle and under its forcewake, at
+// start and every power-up:
+//   accel+0xF86 bit 59: ROW_CHICKEN2 0xE4F4 PUSH_CONST_DEREF_HOLD_DIS (Wa_1409804808)
+//   56-bit flags at accel+0xFE6 (dword, word +0xFEA, byte +0xFEC):
+//     bit 23 FF_THREAD_MODE 0x20A0 bit 19 (Wa_14010919138), bit 43 RCS PSMI_CTL 0x2050 |= 0x10801080
+//     (Wa_1607297627), bit 47 ROW_CHICKEN4 0xE48C DISABLE_TDL_PUSH (Wa_14010229206)
+static void tglApplyLinuxWAFlags(uint8_t *a) {
+ uint64_t before[2]={*reinterpret_cast<uint64_t *>(a+0xF86),0};
+ memcpy(&before[1],a+0xFE6,7);
+ *reinterpret_cast<uint64_t *>(a+0xF86)|=1ULL<<59;
+ *reinterpret_cast<uint32_t *>(a+0xFE6)|=1U<<23;
+ *reinterpret_cast<uint16_t *>(a+0xFEA)|=(1U<<(43-32))|(1U<<(47-32));
+ uint64_t after[2]={*reinterpret_cast<uint64_t *>(a+0xF86),0};
+ memcpy(&after[1],a+0xFE6,7);
+ uint64_t record[4]={before[0],before[1],after[0],after[1]};
+ IORegistryEntry::getRegistryRoot()->setProperty("TGLLinuxWAFlags",record,static_cast<unsigned>(sizeof(record)));
+}
 bool XE::wrapTGLAcceleratorEngine(IOService *that) {
+ if(checkKernelArgument("-wex-tgl-wa"))tglApplyLinuxWAFlags(reinterpret_cast<uint8_t *>(that));
  if (callbackXE->adlnDetected) {
   auto a=reinterpret_cast<uint8_t *>(that);
   uint32_t caps[] {*reinterpret_cast<uint32_t *>(a+0x1120),*reinterpret_cast<uint32_t *>(a+0x1124),
@@ -14371,6 +14817,21 @@ bool XE::wrapTGLAcceleratorEngine(IOService *that) {
 	tglObserveAccelerator(that, 6, false, 0, 0);
 	const bool result = FunctionCast(wrapTGLAcceleratorEngine, callbackXE->orgTGLAcceleratorEngine)(that);
 	tglObserveAccelerator(that, 6, true, result, 0);
+	// -wex-tgl-garb (diagnostic): GARBCNTL 0xB004 reads 0x2fc0108f here and 0x2fc0100f on Linux; clear bit 7 right after
+	// the engine starts (idle, under forcewake). Apple's reset register list saves and restores 0xB004, so it persists.
+	if (result && checkKernelArgument("-wex-tgl-garb") && tglRecoveryForceWake) {
+		auto bar=*reinterpret_cast<volatile uint8_t **>(reinterpret_cast<uint8_t *>(that)+0x1240);
+		uint32_t values[2] {};
+		if (bar) {
+			tglRecoveryForceWake(that,true,7);
+			auto garb=reinterpret_cast<volatile uint32_t *>(bar+0xB004);
+			values[0]=*garb;
+			*garb=values[0]&~0x80U;
+			values[1]=*garb;
+			tglRecoveryForceWake(that,false,7);
+		}
+		IORegistryEntry::getRegistryRoot()->setProperty("TGLGarbBit7",values,static_cast<unsigned>(sizeof(values)));
+	}
 	tglFBIRQEnd(irq,result);
 	if (tglHost.owner==that) tglHostPublish();
 	return result;

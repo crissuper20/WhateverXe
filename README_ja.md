@@ -73,6 +73,7 @@ CPUモデル名や機種固有の設定は不要ですが、実機での動作�
 | --- | --- |
 | Lilu | WhateverXeの動作に必要なランタイム |
 | WhateverXe.kext | OpenCoreでLiluより後に読み込む |
+| Melatonin.kext | 任意の省電力コンパニオン。Lilu非依存 |
 | [WhateverXe Graphics pkg](https://github.com/b00t0x/WhateverXe-Graphics/releases) | 署名済み資材を`/Library`へ導入しAuxKCを更新する |
 | [AMFIPass v1.4.1 Mod](https://github.com/b00t0x/WhateverXe-Graphics/blob/main/extras/AMFIPass-v1.4.1-Mod-RELEASE.zip) | 改変されたグラフィックス構成に必要。OpenCoreで導入する |
 
@@ -131,6 +132,13 @@ OpenCoreの`boot-args`に以下を追加してください。
 | --- | --- |
 | `-allow3d` | Appleドライバの3D処理を有効にする。 |
 | `-disablegfxfirmware` | 現在のバックエンドで、Appleドライバのグラフィックスファームウェア読み込みを無効にする。 |
+
+Melatoninコンパニオンkextには必須引数はありません。読み出し（PMC、リンクのASPM/L1.2/L1.1状態）は、読み込み時にiGPUのIORegistryエントリへ`Melatonin*`プロパティとして公開されます。任意の引数は2つです。
+
+| 引数 | 用途 |
+| --- | --- |
+| `-melpm` | MelatoninがPCIeリンクのレジスタ（ASPM、L1.1/L1.2 substateの制御）へ書き込むことを許可する。未指定では読み出しのみ。 |
+| `-meloff` | Melatoninのprobeを完全に無効にする。 |
 
 `-wex-nopanel`ブート引数は廃止され、不要になりました。内蔵ディスプレイの有無は自動で判定します。
 
@@ -192,7 +200,7 @@ python3 tools/build.py --release
 python3 tools/test.py
 ```
 
-WhateverXeとAppleIntelTGLCompatのkext、およびソースのmanifestは`build/`に出力されます。TGLCompatのソースと共有ヘッダーはこのリポジトリで管理し、署名済みバイナリはWhateverXe Graphicsで配布します。WEXのRelease ZIPに含まれるkextはOpenCore用プラグインのみで、グラフィックスpkgは含みません。任意のdonor再生試験には`--donor /path/to/AppleIntelTGLGraphicsFramebuffer`と`--accelerator /path/to/AppleIntelTGLGraphics`を指定します。各試験が受け付ける正確なバイナリが必要です。CPUテストだけで実GPUの互換性が確認できるわけではありません。ビルドにWhateverGreenのソースは不要です。
+WhateverXe、AppleIntelTGLCompat、Melatoninのkext、およびソースのmanifestは`build/`に出力されます。MelatoninはLiluの開発用ヘッダに依存しません。TGLCompatのソースと共有ヘッダーはこのリポジトリで管理し、署名済みバイナリはWhateverXe Graphicsで配布します。WEXのRelease ZIPに含まれるkextはOpenCore用プラグインのみで、グラフィックスpkgは含みません。任意のdonor再生試験には`--donor /path/to/AppleIntelTGLGraphicsFramebuffer`と`--accelerator /path/to/AppleIntelTGLGraphics`を指定します。各試験が受け付ける正確なバイナリが必要です。CPUテストだけで実GPUの互換性が確認できるわけではありません。ビルドにWhateverGreenのソースは不要です。
 
 ## ライセンスとクレジット
 

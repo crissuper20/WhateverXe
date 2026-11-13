@@ -103,10 +103,18 @@
     "-adlntaskstage",
     "-n97taskstage"
   ],
+  "-wex-cmdcap": [],
   "-wex-display13-trace": [
     "-display13trace",
     "-n97displaytrace"
   ],
+  "-wex-state-inval": [],
+  "-wex-tgl-blitsync": [],
+  "-wex-tgl-depthccs": [],
+  "-wex-tgl-garb": [],
+  "-wex-tgl-l3wb": [],
+  "-wex-tgl-nob104": [],
+  "-wex-tgl-norc6": [],
   "-wex-tgl-off": [
     "-igfxtgloff"
   ],
@@ -125,6 +133,10 @@
   "-wex-tc-bootstrap": [
     "-tgltc-bootstrap"
   ],
+  "-wex-tgl-sba-inval": [],
+  "-wex-tgl-wa": [],
+  "-wex-urb-banks5": [],
+  "-wex-vram3g": [],
   "-wexoff": [
     "-wxeoff"
   ],

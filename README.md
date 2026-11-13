@@ -84,6 +84,8 @@ See [CHANGELOG](CHANGELOG.md) for release notes.
 | --- | --- |
 | Lilu | Runtime required by WhateverXe |
 | WhateverXe.kext | Load through OpenCore after Lilu |
+| Melatonin.kext | Optional power-management companion; no Lilu dependency |
+| itlwm with the ASPM patch | Optional Wi-Fi link power-state variant, built by `tools/itlwm/build_itlwm.py` |
 | [WhateverXe Graphics pkg](https://github.com/b00t0x/WhateverXe-Graphics/releases) | Install the signed graphics stack into `/Library` and rebuild AuxKC |
 | [AMFIPass v1.4.1 Mod](https://github.com/b00t0x/WhateverXe-Graphics/blob/main/extras/AMFIPass-v1.4.1-Mod-RELEASE.zip) | Load through OpenCore for the modified graphics stack |
 
@@ -171,10 +173,24 @@ Add the following to OpenCore's `boot-args`:
 -allow3d -disablegfxfirmware
 ```
 
+The itlwm ASPM variant needs no boot argument. Set `itlwm-aspm` (Boolean) as a
+DeviceProperty on the CNVi PCI nub (`PciRoot(0x0)/Pci(0x14,0x3)`); upstream's
+L0s ban stays in effect, only L1 entry returns, which is what enables the
+L1.1/L1.2 substates Melatonin can then apply.
+
 | Argument | Purpose |
 | --- | --- |
 | `-allow3d` | Enable the Apple driver's 3D path. |
 | `-disablegfxfirmware` | Disable the Apple driver's graphics-firmware loading path for the current backend. |
+
+The Melatonin companion kext has no required arguments. Readouts (PMC, link
+ASPM/L1.2/L1.1 state) are published to the iGPU's IORegistry entry as
+`Melatonin*` properties whenever it loads. Two optional arguments control it:
+
+| Argument | Purpose |
+| --- | --- |
+| `-melpm` | Allow Melatonin to write PCIe link registers (ASPM and L1.1/L1.2 substate controls). Without it the kext stays read-only. |
+| `-meloff` | Disable the Melatonin probe entirely. |
 
 The `-wex-nopanel` boot argument has been removed and is no longer needed.
 WEX automatically handles systems with or without an internal display.
@@ -252,8 +268,8 @@ python3 tools/build.py --release
 python3 tools/test.py
 ```
 
-WhateverXe and AppleIntelTGLCompat kexts and a source manifest are written to
-`build/`. TGLCompat source and shared headers are maintained here; its signed
+WhateverXe, AppleIntelTGLCompat and Melatonin kexts and a source manifest are
+written to `build/`. Melatonin does not depend on Lilu's development headers. TGLCompat source and shared headers are maintained here; its signed
 binary is distributed through WhateverXe Graphics. The WEX release ZIP contains
 only the OpenCore plugin, not the graphics package. Optional donor replay tests
 accept `--donor /path/to/AppleIntelTGLGraphicsFramebuffer` and

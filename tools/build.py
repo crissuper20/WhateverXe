@@ -19,7 +19,13 @@ def main():
  base+=['-fdebug-compilation-dir=.', '-ffile-prefix-map='+str(ROOT)+'=/WhateverXe',
         '-ffile-prefix-map='+str(sdk)+'=/MacKernelSDK', '-ffile-prefix-map='+str(lilu)+'=/Lilu']
  manifest={}
- for name,version,sources in [('WhateverXe','0.6.1',sorted((ROOT/'WhateverXe').glob('*.cpp'))+[lilu/'Library/plugin_start.cpp']),('AppleIntelTGLCompat','0.6.1',[ROOT/'AppleIntelTGLCompat/AppleIntelTGLCompat.cpp'])]:
+ for name,version,sources in [
+  ('WhateverXe','0.6.1',sorted((ROOT/'WhateverXe').glob('*.cpp'))+[lilu/'Library/plugin_start.cpp']),
+  ('AppleIntelTGLCompat','0.6.1',[ROOT/'AppleIntelTGLCompat/AppleIntelTGLCompat.cpp']),
+  # Power-management companion kext: plain IOService on the iGPU nub,
+  # no Lilu dependency, register writes gated behind -melpm.
+  ('Melatonin','0.0.1',sorted((ROOT/'Melatonin').glob('*.cpp'))),
+ ]:
   bundle=out/(name+'.kext')/'Contents';(bundle/'MacOS').mkdir(parents=True,exist_ok=True);objdir=out/name;objdir.mkdir(exist_ok=True)
   objects=[]
   for source in sources:
@@ -37,11 +43,14 @@ def main():
   exe=bundle/'MacOS'/name
   run(['xcrun','ld','-arch','x86_64','-kext','-undefined','dynamic_lookup','-no_fixup_chains','-macos_version_min',('10.6' if name=='WhateverXe' else '10.15'),'-o',exe,*objects,sdk/'Library/x86_64/libkmod.a'])
   libs={x:'10.0.0' for x in ['com.apple.kpi.bsd','com.apple.kpi.dsep','com.apple.kpi.iokit','com.apple.kpi.libkern','com.apple.kpi.mach','com.apple.kpi.unsupported']};libs['com.apple.iokit.IOPCIFamily']='1.1'
-  ident='org.b00t0x.'+name
+  ident='org.b00t0x.'+name if name!='Melatonin' else 'org.crissuper20.Melatonin' # Melatonin is a separate identity from the original maintainer
   info=dict(CFBundleIdentifier=ident,CFBundleExecutable=name,CFBundleName=name,CFBundlePackageType='KEXT',CFBundleVersion=version,CFBundleShortVersionString=version,OSBundleCompatibleVersion=version,OSBundleRequired='Root',OSBundleLibraries=libs)
   if name=='WhateverXe':
    libs['as.vit9696.Lilu']='1.2.0'
    info['IOKitPersonalities']={ident:dict(CFBundleIdentifier=ident,IOClass=name,IOMatchCategory=name,IOProviderClass='IOResources',IOResourceMatch='IOKit')}
+  elif name=='Melatonin':
+   # Matched to the iGPU PCI nub (vendor/class filtered at runtime in start()).
+   info['IOKitPersonalities']={ident:dict(CFBundleIdentifier=ident,IOClass='Melatonin',IOMatchCategory='Melatonin',IOProviderClass='IOPCIDevice')}
   else:
    # This is the oldest compatible provider ABI, not the release version.
    # Existing framebuffer payloads declare a dependency on 0.5.0.
@@ -72,7 +81,7 @@ def main():
  assert ' _WEXVP9Create' in subprocess.check_output(['xcrun','nm','-gU',str(lib)],text=True), 'missing VP9 factory entry'
  manifest['WEXVP9']={'configuration':'RELEASE' if a.release else 'DEBUG','sha256':hashlib.sha256(lib.read_bytes()).hexdigest(),
   'source_sha256':{str(s.relative_to(ROOT)):hashlib.sha256(s.read_bytes()).hexdigest() for s in [vp9,vp9.with_name('vp9_quant.h'),vp9.with_name('vp9_probs.h')]}}
- manifest['headers']={str(p.relative_to(ROOT)):hashlib.sha256(p.read_bytes()).hexdigest() for d in ['WhateverXe','AppleIntelTGLCompat'] for p in sorted((ROOT/d).glob('*.hpp'))}
+ manifest['headers']={str(p.relative_to(ROOT)):hashlib.sha256(p.read_bytes()).hexdigest() for d in ['WhateverXe','AppleIntelTGLCompat','Melatonin'] for p in sorted((ROOT/d).glob('*.hpp'))}
  (out/'build-manifest.json').write_text(json.dumps(manifest,indent=2)+'\n')
  print(json.dumps({n:v['sha256'] for n,v in manifest.items() if n!='headers'},indent=2))
 if __name__=='__main__':main()

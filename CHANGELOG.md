@@ -1,5 +1,43 @@
 # Changelog
 
+## itlwm 2.4.0
+
+Build of OpenIntelWireless/itlwm at 53c51c2 (2.4.0 bump) by
+`tools/itlwm/build_itlwm.py`. Stock by default; the ASPM experiment is retired
+(the CNVi device advertises no ASPM capability: LnkCap = 0 on Linux and macOS
+alike, verified 2026-11-10) and only applies with `--aspm`, kept as an artifact.
+
+### Added
+
+- Wi-Fi auto-connect without HeliPort: `WiFiConfig` (ssid/password per network)
+  injected through DeviceProperties on the CNVi path, matching the property
+  `itlwm.cpp` reads at start to join networks itself.
+
+
+## Melatonin 0.0.1
+
+First release of Melatonin, the power-management companion kext split out of
+WhateverXe. Separate component and identity (`org.crissuper20.Melatonin`), no
+Lilu dependency, loaded against the Intel display PCI nub.
+
+### Added
+
+- Periodic read-only PCH PMC snapshot, per-device PCIe link ASPM/L1.1/L1.2
+  substate readouts, and display power-state readout, published as
+  `MelatoninPMC`, `MelatoninLink`, `MelatoninL1SS`, `MelatoninWalk` and
+  `MelatoninDisplayPower` on the iGPU IORegistry entry.
+- Optional L1 PM Substates repair for the RTL8168h root-port link: enable bits
+  masked by both ports' capability registers plus the larger common-mode
+  restore time, mirroring Apple's own `calculateL1PMParameters` computation
+  (which IOPCIFamily applies only through per-device properties, absent here).
+  Register writes require `-melpm`; without it the kext is read-only.
+
+### Changed
+
+- Remove the PMC probe and PCIe link policy from WhateverXe; all
+  power-efficiency work now lives in this kext.
+
+
 ## 0.6.1
 
 Use the latest [WhateverXe Graphics](https://github.com/b00t0x/WhateverXe-Graphics/releases) package.

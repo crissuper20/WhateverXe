@@ -209,4 +209,22 @@ inline bool metalAdmitted(const void *page,uint64_t offset,bool validated,bool t
  return any;
 }
 inline void applyMetal(uint8_t *page,uint64_t offset) {for(const auto &site:metalSites)if(site.page==offset)applyDriver(page,site);}
+// EXPERIMENT (-wex-tgl-sba-inval): when a render encoder moves the dynamic state base address
+// (sampler states) mid-command-buffer, the driver precedes STATE_BASE_ADDRESS with a CS-stall-only
+// PIPE_CONTROL (DW1 0x00104000) and never invalidates the state cache; Mesa invalidates it after every
+// STATE_BASE_ADDRESS. IGAccelRenderCommandEncoder::writePipeControl builds that DW1 from this base for
+// flush types without bit 0/23. Add State Cache Invalidation (DW1 bit 2) to the base, so every such
+// CS-stall PIPE_CONTROL also invalidates the state cache.
+constexpr DriverSite sbaSites[] {
+ {0x60000,0x766,10,
+  {0x49,0xba,0x00,0x00,0x00,0x00,0x00,0x40,0x10,0x00},
+  {0x49,0xba,0x00,0x00,0x00,0x00,0x04,0x40,0x10,0x00}},
+};
+inline bool sbaAdmitted(const void *page,uint64_t offset,bool validated,bool tainted,const char *build) {
+ if(!page || !validated || tainted || !build || strcmp(build,supportedBuild))return false;
+ for(const auto &site:sbaSites)
+  if(site.page==offset)return !memcmp(static_cast<const uint8_t *>(page)+site.offset,site.before,site.size);
+ return false;
+}
+inline void applySBA(uint8_t *page,uint64_t offset) {for(const auto &site:sbaSites)if(site.page==offset)applyDriver(page,site);}
 }
